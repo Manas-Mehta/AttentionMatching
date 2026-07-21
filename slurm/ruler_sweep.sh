@@ -11,17 +11,22 @@
 #SBATCH --output=slurm_logs/ruler_%x_%A_%a.out
 #SBATCH --error=slurm_logs/ruler_%x_%A_%a.err
 #
-# RULER sweep — one array element per cell.
+# RULER sweep — one array element per cell. Size is set by PRESET.
 #
-#   cells   0-38   baselines (original + no_context), 13 tasks x 3 lengths
-#   cells  39-155  AM-Fast, 13 tasks x 3 lengths x 3 ratios
+#   smoke   8 cells   4 tasks, 4k, 16x,          20 samples
+#   small  24 cells   4 tasks, 4k+16k, 16x+4x,   50 samples
+#   repro  39 cells  13 tasks, 4k, 16x+8x,       50 samples  (~the paper's own script)
+#   full  156 cells  13 tasks, 3 lengths, 3 ratios, 100 samples
+#
+# Baselines always come first in the index order; AM cells follow.
+# Check the layout before submitting:  python experiments/cells.py --preset X --list
 #
 # Usage:
-#   sbatch --array=0-38   slurm/ruler_sweep.sh     # baselines first (cheap)
-#   sbatch --array=39-155 slurm/ruler_sweep.sh     # then AM
-#   sbatch --array=44     slurm/ruler_sweep.sh     # single cell (nm3 4k 16x)
+#   sbatch --export=PRESET=smoke --array=0-7  slurm/ruler_sweep.sh
+#   sbatch --export=PRESET=small --array=0-23 slurm/ruler_sweep.sh
+#   sbatch --export=PRESET=small --array=0-23%4 slurm/ruler_sweep.sh   # throttle to 4 at once
 #
-# Throttle concurrent jobs with e.g. --array=39-155%8
+# NOTE: cell indices are preset-specific. Always pass the same PRESET.
 
 set -eo pipefail
 
@@ -39,27 +44,28 @@ export TOKENIZERS_PARALLELISM=false
 cd "${PROJECT_DIR}"
 mkdir -p slurm_logs results
 
+PRESET="${PRESET:-smoke}"
 IDX="${SLURM_ARRAY_TASK_ID:-${1:-}}"
 if [ -z "$IDX" ]; then
-  echo "usage: sbatch --array=<n> $0   |   $0 <n>" >&2
+  echo "usage: sbatch --export=PRESET=<p> --array=<n> $0   |   PRESET=<p> $0 <n>" >&2
   exit 2
 fi
 
-DESC="$(python experiments/cells.py --list | awk -v i="$IDX" '$1==i {$1=""; print substr($0,2)}')"
+DESC="$(python experiments/cells.py --preset "$PRESET" --list | awk -v i="$IDX" '$1==i {$1=""; print substr($0,2)}')"
 
-echo "=== RULER sweep cell ${IDX} ==="
+echo "=== RULER sweep [${PRESET}] cell ${IDX} ==="
 echo "  cell:      ${DESC}"
 echo "  job:       ${SLURM_JOB_ID:-local}"
 echo "  node:      $(hostname)"
 echo "  GPU:       $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo N/A)"
 echo "  timestamp: $(date)"
 echo ""
-python experiments/cells.py --index "$IDX" | sed 's/^/  cmd: /'
+python experiments/cells.py --preset "$PRESET" --index "$IDX" | sed 's/^/  cmd: /'
 echo ""
 
 start=$(date +%s)
 set +e
-python experiments/cells.py --index "$IDX" --run
+python experiments/cells.py --preset "$PRESET" --index "$IDX" --run
 rc=$?
 set -e
 end=$(date +%s)
@@ -69,7 +75,7 @@ printf '\n=== cell %s done: rc=%d, %dh %dm %ds ===\n' \
   "$IDX" "$rc" $((elapsed/3600)) $(((elapsed%3600)/60)) $((elapsed%60))
 
 # Central timing table for the benchmarking TODO
-printf '%s\t%s\t%d\t%d\t%s\n' "$IDX" "${DESC// /_}" "$elapsed" "$rc" "$(date -Iseconds)" \
+printf '%s\t%s\t%s\t%d\t%d\t%s\n' "$PRESET" "$IDX" "${DESC// /_}" "$elapsed" "$rc" "$(date -Iseconds)" \
   >> results/timings.tsv
 
 exit $rc

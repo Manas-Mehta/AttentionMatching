@@ -2,14 +2,20 @@
 """
 Defines the RULER sweep cell matrix and emits the command for a single cell.
 
-Matrix: 13 tasks x {4k,8k,16k} x {16x,8x,4x} = 117 AM cells,
-plus 13 x 3 = 39 baseline cells (original + no_context, ratio-irrelevant) = 156 total.
+Presets control the size of the sweep. Cell indices are PRESET-SPECIFIC —
+always pass the same --preset to sbatch and to any analysis.
+
+    smoke : 4 diagnostic tasks, 4k only, 16x,          20 samples ->   8 cells
+    small : 4 diagnostic tasks, 4k+16k, 16x+4x,        50 samples ->  24 cells
+    repro : all 13 tasks, 4k only, 16x+8x,             50 samples ->  39 cells
+            (closest match to the paper's own released RULER script)
+    full  : all 13 tasks, 4k+8k+16k, 16x+8x+4x,       100 samples -> 156 cells
 
 Usage:
-    python experiments/cells.py --count
-    python experiments/cells.py --list
-    python experiments/cells.py --index 42          # prints the command
-    python experiments/cells.py --index 42 --run    # runs it
+    python experiments/cells.py --preset smoke --count
+    python experiments/cells.py --preset smoke --list
+    python experiments/cells.py --preset smoke --index 3
+    python experiments/cells.py --preset smoke --index 3 --run
 
 Run from the repo root (the parent of official/).
 """
@@ -21,50 +27,57 @@ from pathlib import Path
 
 MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 BUDGET = "head_budget_optimization/head_budgets/Qwen3-4B-Instruct-2507/optimized_agnostic.json"
-N_SAMPLES = 100
 
-TASKS = [
+ALL_TASKS = [
     "niah_single_1", "niah_single_2", "niah_single_3",
     "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
     "niah_multivalue", "niah_multiquery",
     "vt", "cwe", "fwe", "qa_1", "qa_2",
 ]
-CONTEXTS = ["4k", "8k", "16k"]
-# LCLM's compression ratios -> retained fraction
-RATIOS = {"16x": 0.0625, "8x": 0.125, "4x": 0.25}
+# ns1 = control (no UUID), ns3/nm3 = the UUID collapse, cwe = where AM wins.
+DIAG_TASKS = ["niah_single_1", "niah_single_3", "niah_multikey_3", "cwe"]
+
+# LCLM compression ratio -> retained fraction
+RATIO_FRAC = {"16x": 0.0625, "8x": 0.125, "4x": 0.25}
+
+PRESETS = {
+    "smoke": dict(tasks=DIAG_TASKS, contexts=["4k"],             ratios=["16x"],             samples=20),
+    "small": dict(tasks=DIAG_TASKS, contexts=["4k", "16k"],      ratios=["16x", "4x"],       samples=50),
+    "repro": dict(tasks=ALL_TASKS,  contexts=["4k"],             ratios=["16x", "8x"],       samples=50),
+    "full":  dict(tasks=ALL_TASKS,  contexts=["4k", "8k", "16k"], ratios=["16x", "8x", "4x"], samples=100),
+}
 
 # AM-Fast = AM-HighestAttnKeys-fast: repeat-prefill queries, no self-study, no OMP.
-# This is the config both the AM paper (Table 11) and LCLM used for RULER.
+# Same config the AM paper (Table 11) and LCLM used for RULER.
 AM_METHOD = "highest_attn_keys_rms_nnls2_-3_3_lsq_on-policy"
 AM_ALGO_CONFIG = "best"
 AM_QUERY_CONFIG = "repeat"
 
 
-def build_cells():
+def build_cells(preset):
+    spec = PRESETS[preset]
     cells = []
-    # Baselines first so the ceiling/floor exist before we interpret AM.
-    for ctx in CONTEXTS:
-        for task in TASKS:
-            cells.append({
-                "kind": "baseline", "ctx": ctx, "ratio": "full", "task": task,
-            })
-    for ctx in CONTEXTS:
-        for ratio in RATIOS:
-            for task in TASKS:
-                cells.append({
-                    "kind": "am", "ctx": ctx, "ratio": ratio, "task": task,
-                })
+    # Baselines first: they are cheap and establish the ceiling/floor.
+    for ctx in spec["contexts"]:
+        for task in spec["tasks"]:
+            cells.append(dict(kind="baseline", ctx=ctx, ratio="full", task=task,
+                              samples=spec["samples"], preset=preset))
+    for ctx in spec["contexts"]:
+        for ratio in spec["ratios"]:
+            for task in spec["tasks"]:
+                cells.append(dict(kind="am", ctx=ctx, ratio=ratio, task=task,
+                                  samples=spec["samples"], preset=preset))
     return cells
 
 
 def cell_command(cell):
     ctx, ratio, task = cell["ctx"], cell["ratio"], cell["task"]
-    log_dir = f"../results/ruler/{ctx}/{ratio}"
+    log_dir = f"../results/{cell['preset']}/{ctx}/{ratio}"
     args = [
         sys.executable, "-u", "-m", "evaluation.run_qa_evaluation",
         "--model-name", MODEL,
         "--dataset-name", f"ruler_{ctx}_{task}",
-        "--n-articles", str(N_SAMPLES),
+        "--n-articles", str(cell["samples"]),
         "--start-article", "0",
         "--log-dir", log_dir,
         "--name", task,
@@ -76,7 +89,7 @@ def cell_command(cell):
     else:
         args += [
             "--methods", AM_METHOD,
-            "--target-size", str(RATIOS[ratio]),
+            "--target-size", str(RATIO_FRAC[ratio]),
             "--query-config", AM_QUERY_CONFIG,
             "--algorithm-config", AM_ALGO_CONFIG,
             "--precomputed-budget-path", BUDGET,
@@ -87,39 +100,49 @@ def cell_command(cell):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--preset", default="smoke", choices=sorted(PRESETS))
     p.add_argument("--count", action="store_true")
     p.add_argument("--list", action="store_true")
+    p.add_argument("--summary", action="store_true")
     p.add_argument("--index", type=int)
     p.add_argument("--run", action="store_true")
     a = p.parse_args()
 
-    cells = build_cells()
+    if a.summary:
+        print(f"{'preset':8s} {'cells':>6s} {'samples':>8s} {'evals':>8s}  scope")
+        for name, s in PRESETS.items():
+            cells = build_cells(name)
+            n_am = sum(1 for c in cells if c["kind"] == "am")
+            n_bl = len(cells) - n_am
+            evals = (n_am + 2 * n_bl) * s["samples"]
+            print(f"{name:8s} {len(cells):6d} {s['samples']:8d} {evals:8d}  "
+                  f"{len(s['tasks'])} tasks x {'+'.join(s['contexts'])} x {'+'.join(s['ratios'])}")
+        return
+
+    cells = build_cells(a.preset)
 
     if a.count:
-        print(len(cells))
-        return
+        print(len(cells)); return
     if a.list:
         for i, c in enumerate(cells):
             print(f"{i:4d}  {c['kind']:8s} {c['ctx']:>3s} {c['ratio']:>4s}  {c['task']}")
         return
     if a.index is None:
-        p.error("need --count, --list, or --index")
-
+        p.error("need --count, --list, --summary, or --index")
     if not (0 <= a.index < len(cells)):
-        p.error(f"index {a.index} out of range 0..{len(cells)-1}")
+        p.error(f"index {a.index} out of range 0..{len(cells)-1} for preset '{a.preset}'")
 
     cell = cells[a.index]
     cmd = cell_command(cell)
 
     if not a.run:
-        print(" ".join(shlex.quote(x) for x in cmd))
-        return
+        print(" ".join(shlex.quote(x) for x in cmd)); return
 
     official = Path(__file__).resolve().parent.parent / "official"
     if not official.is_dir():
         sys.exit(f"official/ not found at {official}")
-    print(f"[cell {a.index}] {cell['kind']} ctx={cell['ctx']} ratio={cell['ratio']} task={cell['task']}",
-          flush=True)
+    print(f"[{a.preset} cell {a.index}] {cell['kind']} ctx={cell['ctx']} "
+          f"ratio={cell['ratio']} task={cell['task']} n={cell['samples']}", flush=True)
     raise SystemExit(subprocess.call(cmd, cwd=official))
 
 
