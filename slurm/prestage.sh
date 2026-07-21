@@ -9,9 +9,17 @@ set -eo pipefail   # NOT -u: conda's activate.d scripts use unbound vars
 NETID="mm14444"
 SCRATCH="/scratch/${NETID}"
 
-set +u                      # conda activate.d touches unbound vars
-eval "$(conda shell.bash hook)"
-conda activate "${SCRATCH}/conda_envs/am"
+# Activate whichever env exists (conda preferred, venv fallback)
+set +u
+if [ -d "${SCRATCH}/conda_envs/am" ]; then
+  eval "$(conda shell.bash hook)"
+  conda activate "${SCRATCH}/conda_envs/am"
+elif [ -d "${SCRATCH}/venvs/am" ]; then
+  source "${SCRATCH}/venvs/am/bin/activate"
+else
+  echo "no env found: build one with env/setup_torch.sh or env/setup_venv.sh" >&2
+  exit 1
+fi
 set -u
 
 export HF_HOME="${SCRATCH}/hf_cache"
