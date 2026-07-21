@@ -1,7 +1,21 @@
 # --- personal working files (deliberately untracked) ---
+# Working notes live OUTSIDE this repo, in ../Notes/
 TODO.md
 NOTES.md
+notes/
+Notes/
 scratch/
+
+# --- papers / documents: never tracked ---
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.key
+*.pages
+*.epub
+*.djvu
 
 # --- experiment outputs ---
 results/
