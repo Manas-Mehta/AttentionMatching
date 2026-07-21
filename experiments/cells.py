@@ -40,11 +40,16 @@ DIAG_TASKS = ["niah_single_1", "niah_single_3", "niah_multikey_3", "cwe"]
 # LCLM compression ratio -> retained fraction
 RATIO_FRAC = {"16x": 0.0625, "8x": 0.125, "4x": 0.25}
 
+# smoke is deliberately minimal: just enough to prove the pipeline runs and to
+# anchor the 4k-vs-16k cost ratio for extrapolation.
+#   ns1 -> AM should score ~100, so it validates that AM *works*
+#   nm3 -> AM should score ~0, which is the expected result and therefore CANNOT
+#          validate anything on its own; ns1 is the real check.
 PRESETS = {
-    "smoke": dict(tasks=DIAG_TASKS, contexts=["4k"],             ratios=["16x"],             samples=20),
-    "small": dict(tasks=DIAG_TASKS, contexts=["4k", "16k"],      ratios=["16x", "4x"],       samples=50),
-    "repro": dict(tasks=ALL_TASKS,  contexts=["4k"],             ratios=["16x", "8x"],       samples=50),
-    "full":  dict(tasks=ALL_TASKS,  contexts=["4k", "8k", "16k"], ratios=["16x", "8x", "4x"], samples=100),
+    "smoke": dict(tasks=["niah_single_1", "niah_multikey_3"],
+                  contexts=["4k", "16k"], ratios=["16x"], samples=4),
+    "repro": dict(tasks=ALL_TASKS,  contexts=["4k"],              ratios=["16x", "8x"],       samples=50),
+    "full":  dict(tasks=ALL_TASKS,  contexts=["4k", "8k", "16k"], ratios=["16x", "8x", "4x"], samples=50),
 }
 
 # AM-Fast = AM-HighestAttnKeys-fast: repeat-prefill queries, no self-study, no OMP.
