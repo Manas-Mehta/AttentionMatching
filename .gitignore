@@ -1,0 +1,31 @@
+# --- personal working files (deliberately untracked) ---
+TODO.md
+NOTES.md
+scratch/
+
+# --- experiment outputs ---
+results/
+logs/
+*.out
+*.err
+slurm-*.out
+
+# --- caches / envs ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+wandb/
+
+# --- model + dataset caches (never commit weights) ---
+hf_cache/
+*.safetensors
+*.bin
+*.pt
+
+# --- os / editor ---
+.DS_Store
+.vscode/
+.idea/
