@@ -80,14 +80,53 @@ for reproducing a single rare exact string:
   unlikely to survive selection intact — and even if the keys survive, the refit
   values are a projection that blurs exactly the fine detail needed.
 
-Two secondary suspects worth ruling in/out:
-- **β pruning.** HighestAttnKeys clamps `β ∈ [-3,3]`; OMP discards keys with `β < -7`.
-  A needle key with very negative β contributes ~nothing regardless of `C_v`.
-- **Chunking.** At 16k with default `--chunk-size 4096` the context splits into 4
-  chunks compacted independently. Note AM-Fast on **ns1** goes 100.00 (4k) → 100.00
-  (8k) → **52.05** (16k). ns1 has no UUIDs at all, so *something length-dependent
-  breaks that is not the UUID effect*. Chunking is the leading suspect. These are two
-  separate failure modes and should not be conflated.
+Also worth ruling in/out: **β pruning.** HighestAttnKeys clamps `β ∈ [-3,3]`; OMP
+discards keys with `β < -7`. A needle key with very negative β contributes ~nothing
+regardless of `C_v`.
+
+## A SECOND, ratio-independent failure mode (16k)
+
+Do not conflate this with the UUID effect. AM-Fast on **ns1** — which contains no
+UUIDs — across every length x ratio cell:
+
+| Context | 16x | 8x | 4x |
+|---|---:|---:|---:|
+| 4k  | 100.00 | 100.00 | 100.00 |
+| 8k  | 100.00 | 97.60 | 99.40 |
+| **16k** | **52.05** | **51.20** | **60.00** |
+
+Broken at *all three ratios*, including 4x. AM-Slow behaves identically (61.00 / 53.80
+/ 54.40). Every other method at 16k/4x gets ns1 = 100.00 (ExpAttn, KVzip, KVzipFast)
+or ~99.6 (LCLM).
+
+**vt** (variable tracking) shows the same signature: 95.16 / 96.60 / 98.75 at 4k, fine
+at 8k, then **54.92 / 55.24 / 63.56** at 16k against a 99.52 ceiling.
+
+Contrast the two patterns directly:
+
+| | ns3 / nm3 (UUID) @16k | ns1 / vt @16k |
+|---|---|---|
+| 16x | 0.20 / 0.00 | 52.05 / 54.92 |
+| 8x | 10.40 / 13.40 | 51.20 / 55.24 |
+| 4x | **80.20 / 91.20** | **60.00 / 63.56** |
+| Pattern | **recovers** with budget | **flat** — budget doesn't help |
+| Reading | capacity / selection | implementation or conditioning |
+
+A ratio-independent failure is not a capacity problem — giving AM 4x the budget
+changes nothing, so it is not "too few keys retained."
+
+**Hypothesis: ill-conditioning on homogeneous contexts.** ns1's haystack is a single
+sentence repeated; vt is a chain of near-identical assignments. Both produce many
+near-duplicate keys. Near-duplicate columns make `XᵀX` near-singular, so the
+least-squares refit `C_v = (XᵀX)⁻¹XᵀY` and OMP's greedy selection both degrade — and
+this gets worse with length (4x more near-identical keys at 16k than 4k) but is
+*independent of how many you keep*. This would also explain LCLM's note that AM "fails
+at 512K tokens due to numerical instability in the linear solver."
+
+Competing explanation: **chunking**. At 16k with default `--chunk-size 4096` the
+context splits into 4 independently-compacted chunks. But 8k would already be 2 chunks
+and 8k is fine, so chunking alone does not obviously explain a cliff between 8k and
+16k. Testable either way (P4/P5 below).
 
 ## Testable predictions
 
@@ -102,6 +141,13 @@ Two secondary suspects worth ruling in/out:
   answers the "is there a clear reason for the dropoff" key question.
 - **P4** — disable chunking at 16k; if ns1 recovers from 52.05, the length dropoff is
   a chunking artifact separable from the UUID effect.
+- **P5** — log the condition number of `XᵀX` (and OMP residual decay) per head on
+  ns1/vt vs ns3/qa1 at 4k vs 16k. If conditioning blows up specifically on the
+  repetitive-context tasks at 16k, that confirms the ill-conditioning story and
+  predicts a cheap fix (ridge / rank-truncation in the solver). Note the AM paper
+  says it *tried* ℓ2 regularisation `(XᵀX + λI)⁻¹` and found it hurt on QuALITY —
+  but QuALITY is 5-8k prose, exactly the regime where conditioning is fine. It may
+  well help at 16k on homogeneous contexts. That would be a clean contribution.
 
 ## Open questions about the LCLM numbers
 
