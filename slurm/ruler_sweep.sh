@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ruler_am
 #SBATCH --account=torch_pr_219_courant
-#SBATCH --partition=l40s_courant   # override: sbatch --partition=<h200 partition>
+#SBATCH --partition=h200_courant   # override: sbatch --partition=l40s_courant
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
@@ -21,7 +21,7 @@
 # Check the layout before submitting:  python experiments/cells.py --preset X --list
 #
 # Usage:
-#   sbatch --export=PRESET=smoke --array=0-7 --partition=<h200> slurm/ruler_sweep.sh
+#   sbatch --export=PRESET=smoke --array=0-7 --partition=l40s_courant slurm/ruler_sweep.sh
 #   sbatch --export=PRESET=full  --array=0-155%8 slurm/ruler_sweep.sh   # throttle to 8 at once
 #
 # NOTE: cell indices are preset-specific. Always pass the same PRESET.
@@ -32,8 +32,10 @@ NETID="mm14444"
 SCRATCH="/scratch/${NETID}"
 PROJECT_DIR="${SCRATCH}/AttentionMatching"
 
+set +u                      # conda activate.d touches unbound vars
 eval "$(conda shell.bash hook)"
 conda activate "${SCRATCH}/conda_envs/am"
+set -u
 
 export HF_HOME="${SCRATCH}/hf_cache"
 export HF_HUB_OFFLINE=1              # compute nodes have no internet — pre-stage first

@@ -1,12 +1,13 @@
 #!/bin/bash
 # One-time environment build on the Torch login node.
 #   bash env/setup_torch.sh
-set -euo pipefail
+set -eo pipefail   # NOT -u: conda's activate.d scripts use unbound vars
 
 NETID="mm14444"
 SCRATCH="/scratch/${NETID}"
 ENV_PATH="${SCRATCH}/conda_envs/am"
 
+set +u                      # conda activate.d touches unbound vars
 eval "$(conda shell.bash hook)"
 
 if [ -d "${ENV_PATH}" ]; then
@@ -15,6 +16,7 @@ else
   conda create -y -p "${ENV_PATH}" python=3.12
 fi
 conda activate "${ENV_PATH}"
+set -u
 
 export PIP_CACHE_DIR="${SCRATCH}/pip_cache"
 

@@ -4,13 +4,15 @@
 #
 #   bash slurm/prestage.sh
 #
-set -euo pipefail
+set -eo pipefail   # NOT -u: conda's activate.d scripts use unbound vars
 
 NETID="mm14444"
 SCRATCH="/scratch/${NETID}"
 
+set +u                      # conda activate.d touches unbound vars
 eval "$(conda shell.bash hook)"
 conda activate "${SCRATCH}/conda_envs/am"
+set -u
 
 export HF_HOME="${SCRATCH}/hf_cache"
 unset HF_HUB_OFFLINE
