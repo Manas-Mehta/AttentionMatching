@@ -1,34 +1,48 @@
 #!/bin/bash
-# Run this ON THE LOGIN NODE (it needs internet). Compute nodes run with
-# HF_HUB_OFFLINE=1, so everything must be cached first. Resumable — safe to
-# re-run if the login node kills it partway.
+# Run this ON THE LOGIN NODE (needs internet). Compute nodes are offline, so all
+# assets must be cached first. The login node kills big downloads partway, so we
+# retry in a loop — snapshot_download resumes from the partial cache each time.
 #
 #   bash slurm/prestage.sh
 #
 set -eo pipefail
 
 SCRATCH="/scratch/${USER}"
-ENV="${SCRATCH}/conda_envs/am"
+PY="${SCRATCH}/conda_envs/am/bin/python"     # use the am env explicitly
 
 export HF_HOME="${SCRATCH}/hf_cache"
 export TMPDIR="${SCRATCH}/tmp"; mkdir -p "${TMPDIR}"
+export HF_HUB_ENABLE_HF_TRANSFER=0
 unset HF_HUB_OFFLINE
 echo "HF_HOME=${HF_HOME}"
+echo "python: ${PY}"
 echo
 
-# Download FILES only (snapshot_download), not load_dataset — building an in-memory
-# arrow table for the 16k config is what likely tripped the login-node memory cap.
-# snapshot_download streams to disk and resumes from partial cache.
-"${ENV}/bin/python" - <<'PY'
+# --- datasets (small, one shot) ---
+"${PY}" - <<'PY'
 from huggingface_hub import snapshot_download
-
-print("--- ruler dataset (all configs, parquet) ---", flush=True)
 p = snapshot_download("simonjegou/ruler", repo_type="dataset")
-print("    ->", p, "\n", flush=True)
-
-print("--- model Qwen/Qwen3-4B-Instruct-2507 ---", flush=True)
-p = snapshot_download("Qwen/Qwen3-4B-Instruct-2507")
-print("    ->", p, flush=True)
-
-print("\nDownload complete. Verify with: python experiments/verify_assets.py", flush=True)
+print("ruler dataset ->", p)
 PY
+
+# --- model (retry loop; resumes each time until complete) ---
+echo
+echo "Downloading model (will retry through login-node kills)..."
+for attempt in $(seq 1 20); do
+  if "${PY}" - <<'PY'
+from huggingface_hub import snapshot_download
+p = snapshot_download("Qwen/Qwen3-4B-Instruct-2507",
+                      max_workers=1)      # one file at a time -> lower memory
+print("model ->", p)
+PY
+  then
+    echo "model download complete on attempt ${attempt}"
+    break
+  else
+    echo "attempt ${attempt} killed/failed — resuming..."
+    sleep 3
+  fi
+done
+
+echo
+echo "Now verify:  ${PY} experiments/verify_assets.py"
