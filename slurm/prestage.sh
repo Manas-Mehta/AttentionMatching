@@ -1,62 +1,34 @@
 #!/bin/bash
 # Run this ON THE LOGIN NODE (it needs internet). Compute nodes run with
-# HF_HUB_OFFLINE=1, so everything must be in the cache before any sbatch.
+# HF_HUB_OFFLINE=1, so everything must be cached first. Resumable — safe to
+# re-run if the login node kills it partway.
 #
 #   bash slurm/prestage.sh
 #
-set -eo pipefail   # NOT -u: conda's activate.d scripts use unbound vars
+set -eo pipefail
 
-NETID="mm14444"
-SCRATCH="/scratch/${NETID}"
-
-# Activate whichever env exists (conda preferred, venv fallback)
-set +u
-if [ -d "${SCRATCH}/conda_envs/am" ]; then
-  eval "$(conda shell.bash hook)"
-  conda activate "${SCRATCH}/conda_envs/am"
-elif [ -d "${SCRATCH}/venvs/am" ]; then
-  source "${SCRATCH}/venvs/am/bin/activate"
-else
-  echo "no env found: build one with env/setup_torch.sh or env/setup_venv.sh" >&2
-  exit 1
-fi
-set -u
+SCRATCH="/scratch/${USER}"
+ENV="${SCRATCH}/conda_envs/am"
 
 export HF_HOME="${SCRATCH}/hf_cache"
+export TMPDIR="${SCRATCH}/tmp"; mkdir -p "${TMPDIR}"
 unset HF_HUB_OFFLINE
-
 echo "HF_HOME=${HF_HOME}"
 echo
 
-python - <<'PY'
-import os
+# Download FILES only (snapshot_download), not load_dataset — building an in-memory
+# arrow table for the 16k config is what likely tripped the login-node memory cap.
+# snapshot_download streams to disk and resumes from partial cache.
+"${ENV}/bin/python" - <<'PY'
 from huggingface_hub import snapshot_download
-from datasets import load_dataset
 
-MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+print("--- ruler dataset (all configs, parquet) ---", flush=True)
+p = snapshot_download("simonjegou/ruler", repo_type="dataset")
+print("    ->", p, "\n", flush=True)
 
-print(f"--- model: {MODEL} ---", flush=True)
-p = snapshot_download(MODEL)
-print(f"    cached at {p}\n", flush=True)
+print("--- model Qwen/Qwen3-4B-Instruct-2507 ---", flush=True)
+p = snapshot_download("Qwen/Qwen3-4B-Instruct-2507")
+print("    ->", p, flush=True)
 
-for cfg in ["4096", "8192", "16384"]:
-    print(f"--- ruler config {cfg} ---", flush=True)
-    ds = load_dataset("simonjegou/ruler", cfg, split="test")
-    tasks = sorted(set(ds["task"]))
-    print(f"    {len(ds)} rows, {len(tasks)} tasks", flush=True)
-    assert len(ds) == 6500, f"expected 6500 rows, got {len(ds)}"
-    assert len(tasks) == 13, f"expected 13 tasks, got {len(tasks)}"
-print("\nAll assets cached.")
-PY
-
-echo
-echo "Verifying offline load works (simulates a compute node)..."
-HF_HUB_OFFLINE=1 python - <<'PY'
-from datasets import load_dataset
-from transformers import AutoConfig
-AutoConfig.from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
-for cfg in ["4096", "8192", "16384"]:
-    d = load_dataset("simonjegou/ruler", cfg, split="test")
-    print(f"  ruler/{cfg}: {len(d)} rows  OK")
-print("Offline load OK — safe to sbatch.")
+print("\nDownload complete. Verify with: python experiments/verify_assets.py", flush=True)
 PY
