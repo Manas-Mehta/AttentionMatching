@@ -37,6 +37,10 @@ ALL_TASKS = [
 # ns1 = control (no UUID), ns3/nm3 = the UUID collapse, cwe = where AM wins.
 DIAG_TASKS = ["niah_single_1", "niah_single_3", "niah_multikey_3", "cwe"]
 
+# The 5 tasks whose PATTERN we study -> full sample count. Everything else runs
+# at a token count just for the full-table cross-check vs LCLM.
+KEEP_TASKS = ["niah_single_1", "niah_single_3", "niah_multikey_3", "cwe", "vt"]
+
 # LCLM compression ratio -> retained fraction
 RATIO_FRAC = {"16x": 0.0625, "8x": 0.125, "4x": 0.25}
 
@@ -55,12 +59,25 @@ BASELINE_ALGO_CONFIG = "summarize"
 #   ns1 -> AM should score ~100, so it validates that AM *works*
 #   nm3 -> AM should score ~0, which is the expected result and therefore CANNOT
 #          validate anything on its own; ns1 is the real check.
+# `samples` may be an int (all tasks) or a dict {"keep": n, "other": m}.
 PRESETS = {
     "smoke": dict(tasks=["niah_single_1", "niah_multikey_3"],
                   contexts=["4k", "16k"], ratios=["16x"], samples=4),
     "repro": dict(tasks=ALL_TASKS,  contexts=["4k"],              ratios=["16x", "8x"],       samples=50),
     "full":  dict(tasks=ALL_TASKS,  contexts=["4k", "8k", "16k"], ratios=["16x", "8x", "4x"], samples=50),
+    # diag: 5 KEEP_TASKS at 50 samples, the other 8 at 2 (full-table cross-check only).
+    # Same 13-task index layout as `full`, and writes into results/full/ (out="full")
+    # so cells already finished under `full` are not recomputed.
+    "diag":  dict(tasks=ALL_TASKS,  contexts=["4k", "8k", "16k"], ratios=["16x", "8x", "4x"],
+                  samples={"keep": 50, "other": 2}, out="full"),
 }
+
+
+def _samples_for(spec, task):
+    s = spec["samples"]
+    if isinstance(s, int):
+        return s
+    return s["keep"] if task in KEEP_TASKS else s["other"]
 
 # AM-Fast = AM-HighestAttnKeys-fast: repeat-prefill queries, no self-study, no OMP.
 # Same config the AM paper (Table 11) and LCLM used for RULER.
@@ -76,18 +93,19 @@ def build_cells(preset):
     for ctx in spec["contexts"]:
         for task in spec["tasks"]:
             cells.append(dict(kind="baseline", ctx=ctx, ratio="full", task=task,
-                              samples=spec["samples"], preset=preset))
+                              samples=_samples_for(spec, task), preset=preset))
     for ctx in spec["contexts"]:
         for ratio in spec["ratios"]:
             for task in spec["tasks"]:
                 cells.append(dict(kind="am", ctx=ctx, ratio=ratio, task=task,
-                                  samples=spec["samples"], preset=preset))
+                                  samples=_samples_for(spec, task), preset=preset))
     return cells
 
 
 def cell_command(cell):
     ctx, ratio, task = cell["ctx"], cell["ratio"], cell["task"]
-    log_dir = f"../results/{cell['preset']}/{ctx}/{ratio}"
+    out = PRESETS[cell["preset"]].get("out", cell["preset"])
+    log_dir = f"../results/{out}/{ctx}/{ratio}"
     args = [
         sys.executable, "-u", "-m", "evaluation.run_qa_evaluation",
         "--model-name", MODEL,
