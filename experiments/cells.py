@@ -40,6 +40,16 @@ DIAG_TASKS = ["niah_single_1", "niah_single_3", "niah_multikey_3", "cwe"]
 # LCLM compression ratio -> retained fraction
 RATIO_FRAC = {"16x": 0.0625, "8x": 0.125, "4x": 0.25}
 
+# vllm max_model_len per context. Must cover repeat-prefill, which builds a
+# "{C} Repeat the previous context. {C}" sequence ~2x the RULER context length.
+# All values are < the model's native 262144, so no YaRN is triggered. Without
+# this, vllm defaults to 262144 and OOMs its KV cache on smaller GPUs (e.g. L40S).
+MAX_MODEL_LEN = {"4k": 16384, "8k": 24576, "16k": 40960}
+
+# Baseline methods (original, no_context) are registered in the `summarize` config,
+# not `fast`/`best`. This matches the paper's own qwen-ruler.sh baseline line.
+BASELINE_ALGO_CONFIG = "summarize"
+
 # smoke is deliberately minimal: just enough to prove the pipeline runs and to
 # anchor the 4k-vs-16k cost ratio for extrapolation.
 #   ns1 -> AM should score ~100, so it validates that AM *works*
@@ -86,11 +96,13 @@ def cell_command(cell):
         "--start-article", "0",
         "--log-dir", log_dir,
         "--name", task,
+        "--max-model-len", str(MAX_MODEL_LEN[ctx]),  # bound vllm KV cache; covers repeat-prefill
         "--compute-perplexity", "0",   # separate experiment; keeps the sweep fast
         "--compute-stats", "0",        # can OOM on long contexts
     ]
     if cell["kind"] == "baseline":
-        args += ["--methods", "original", "no_context", "--target-size", "0.99"]
+        args += ["--methods", "original", "no_context",
+                 "--algorithm-config", BASELINE_ALGO_CONFIG, "--target-size", "0.99"]
     else:
         args += [
             "--methods", AM_METHOD,
