@@ -18,11 +18,17 @@ echo "HF_HOME=${HF_HOME}"
 echo "python: ${PY}"
 echo
 
-# --- datasets (small, one shot) ---
+# --- datasets ---
+# snapshot_download gets the parquet, but datasets 4.x still hits the Hub for
+# metadata in offline mode. So we ALSO run load_dataset here (online) to build the
+# arrow cache; offline compute nodes then read straight from that cache.
 "${PY}" - <<'PY'
 from huggingface_hub import snapshot_download
-p = snapshot_download("simonjegou/ruler", repo_type="dataset")
-print("ruler dataset ->", p)
+from datasets import load_dataset
+snapshot_download("simonjegou/ruler", repo_type="dataset")
+for c in ["4096", "8192", "16384"]:
+    d = load_dataset("simonjegou/ruler", c, split="test")
+    print(f"ruler {c}: {len(d)} rows cached")
 PY
 
 # --- model (retry loop; resumes each time until complete) ---
