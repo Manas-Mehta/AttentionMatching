@@ -20,6 +20,7 @@ Usage:
 Run from the repo root (the parent of official/).
 """
 import argparse
+import os
 import shlex
 import subprocess
 import sys
@@ -70,6 +71,11 @@ PRESETS = {
     # so cells already finished under `full` are not recomputed.
     "diag":  dict(tasks=ALL_TASKS,  contexts=["4k", "8k", "16k"], ratios=["16x", "8x", "4x"],
                   samples={"keep": 50, "other": 2}, out="full"),
+    # quick5: identical 156-index layout to `full` (so array indices carry over), but
+    # 5 samples/cell for fast OUTPUTS to eyeball (scores are noisy at n=5, in steps of
+    # 20%). Writes to results/quick5/ so it never overwrites the 50-sample `full/` data.
+    "quick5": dict(tasks=ALL_TASKS, contexts=["4k", "8k", "16k"], ratios=["16x", "8x", "4x"],
+                   samples=5, out="quick5"),
 }
 
 
@@ -110,8 +116,11 @@ def cell_command(cell):
         sys.executable, "-u", "-m", "evaluation.run_qa_evaluation",
         "--model-name", MODEL,
         "--dataset-name", f"ruler_{ctx}_{task}",
-        "--n-articles", str(cell["samples"]),
-        "--start-article", "0",
+        # RULER_START / RULER_N env vars allow resuming: e.g. RULER_START=5 RULER_N=45
+        # skips the first 5 docs already run under quick5, so 0-4 (quick5) + 5-49 (this)
+        # = exactly 50 unique docs. Unset -> full run of `samples` docs from index 0.
+        "--n-articles", os.environ.get("RULER_N", str(cell["samples"])),
+        "--start-article", os.environ.get("RULER_START", "0"),
         "--log-dir", log_dir,
         "--name", task,
         "--max-model-len", str(MAX_MODEL_LEN[ctx]),  # bound vllm KV cache; covers repeat-prefill
