@@ -28,7 +28,8 @@ PROJECT_DIR="${SCRATCH}/AttentionMatching"
 
 set -eo pipefail
 set +u
-eval "$(conda shell.bash hook)"
+# batch jobs don't source ~/.bashrc, so `conda` isn't on PATH — source it directly
+source "${SCRATCH}/miniforge3/etc/profile.d/conda.sh"
 conda activate "${CONDA_ENV}"
 set -u
 
