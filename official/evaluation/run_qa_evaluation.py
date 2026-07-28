@@ -144,6 +144,15 @@ def main():
         default=0,
         help='Only compute perplexity without generating new answers (implies --compute-perplexity). 1 to enable, 0 to disable (default: 0)'
     )
+    parser.add_argument(
+        '--compute-gold-perplexity',
+        type=int,
+        default=0,
+        help='RULER only: teacher-forced perplexity of the GOLD answer (true UUID/number) under '
+             'the AM-compressed cache, plus full-context (ceiling) and no-context (floor) baselines, '
+             'with a per-gold-token NLL profile. Independent of --compute-perplexity. '
+             '1 to enable, 0 to disable (default: 0)'
+    )
 
     # Model arguments
     parser.add_argument(
@@ -307,6 +316,7 @@ def main():
         compute_stats=bool(args.compute_stats),
         verbose_logging=bool(args.verbose_logging),
         compute_perplexity=bool(args.compute_perplexity or args.perplexity_only),
+        compute_gold_perplexity=bool(args.compute_gold_perplexity),
         perplexity_only=bool(args.perplexity_only),
         method_kwargs=method_kwargs,
         log_dir=args.log_dir,

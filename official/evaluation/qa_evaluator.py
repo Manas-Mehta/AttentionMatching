@@ -362,6 +362,7 @@ class QAEvaluator:
         compute_stats: bool = False,
         verbose_logging: bool = False,
         compute_perplexity: bool = False,
+        compute_gold_perplexity: bool = False,
         perplexity_only: bool = False,
         article_idx: int = 0,
         max_new_tokens: int = 2048,
@@ -1253,6 +1254,66 @@ class QAEvaluator:
             else:
                 print(f"Warning: No reference answers available, skipping perplexity computation")
 
+        # [gold-perplexity experiment] Teacher-forced perplexity of the GOLD answer
+        # (the true UUID / number) under three memories: AM-compressed cache, full
+        # context (ceiling ~1), and no context (floor ~16/hex). Measures how many bits
+        # of the exact key survive compaction, and localizes the loss per gold token.
+        # Independent of --compute-perplexity (which measures the model's own generation).
+        if compute_gold_perplexity and is_ruler_eval and compacted_cache is not None:
+            from .utils import (
+                compute_gold_perplexity_on_cache_verbose,
+                compute_perplexity_on_ground_truth_with_text,
+            )
+            full_ctx_text = format_context(self.tokenizer, article_data['article'], model_name=self.model_name)
+            gold_osl = effective_seq_len if use_text_based_generation else seq_len
+            print(f"\n{'='*60}")
+            print(f"Gold-answer perplexity  (full-ctx ceiling | AM-compressed | no-ctx floor)")
+            print(f"{'='*60}")
+            gold_ppl_list = []
+            for i, q in enumerate(questions):
+                refs = q.get('ruler_outputs', []) or []
+                if not refs:
+                    continue
+                gold_str = refs[0]
+                qf = format_question(self.tokenizer, q['question'], q.get('options', None), self.model_name)
+
+                am = compute_gold_perplexity_on_cache_verbose(
+                    self.model, self.tokenizer, compacted_cache, qf, gold_str,
+                    device=self.device, original_seq_len=gold_osl,
+                )
+                full_ppl, full_logppl, _ = compute_perplexity_on_ground_truth_with_text(
+                    self.model, self.tokenizer, full_ctx_text, qf, gold_str, device=self.device,
+                )
+                none_ppl, none_logppl, _ = compute_perplexity_on_ground_truth_with_text(
+                    self.model, self.tokenizer, "", qf, gold_str, device=self.device,
+                )
+                gp = {
+                    'question_id': q.get('question_id', i),
+                    'gold': gold_str,
+                    'am_perplexity': am['perplexity'],
+                    'am_log_perplexity': am['log_perplexity'],
+                    'am_total_bits': am['total_bits'],
+                    'full_perplexity': full_ppl,
+                    'full_log_perplexity': full_logppl,
+                    'none_perplexity': none_ppl,
+                    'none_log_perplexity': none_logppl,
+                    'num_gold_tokens': am['num_tokens'],
+                    'am_per_token_nll': am['per_token_nll'],
+                    'am_per_token_ppl': am['per_token_ppl'],
+                    'gold_token_strings': am['token_strings'],
+                }
+                if i < len(results_per_question):
+                    results_per_question[i]['gold_perplexity'] = gp
+                gold_ppl_list.append(gp)
+                print(f"  q{i}  gold={gold_str}")
+                print(f"       full={full_ppl:8.3f}   AM={am['perplexity']:8.3f}   none={none_ppl:8.3f}   "
+                      f"({am['num_tokens']} tok, AM {am['total_bits']:.1f} bits lost-ceiling)")
+            if gold_ppl_list:
+                _mean = lambda k: sum(g[k] for g in gold_ppl_list) / len(gold_ppl_list)
+                print(f"\n  cell means:  full={_mean('full_perplexity'):.3f}   "
+                      f"AM={_mean('am_perplexity'):.3f}   none={_mean('none_perplexity'):.3f}   "
+                      f"(n={len(gold_ppl_list)})")
+
         # Compute accuracy metrics
         if is_perplexity_eval:
             # Perplexity-based dataset: no accuracy metrics, just perplexity
@@ -2092,6 +2153,7 @@ class QAEvaluator:
         compute_stats: bool = False,
         verbose_logging: bool = False,
         compute_perplexity: bool = False,
+        compute_gold_perplexity: bool = False,
         perplexity_only: bool = False,
         method_kwargs: Optional[Dict[str, Dict]] = None,
         log_dir: str = 'logs/qa_evaluation',
@@ -2262,6 +2324,7 @@ class QAEvaluator:
                     compute_stats=compute_stats,
                     verbose_logging=verbose_logging,
                     compute_perplexity=compute_perplexity,
+                    compute_gold_perplexity=compute_gold_perplexity,
                     perplexity_only=perplexity_only,
                     article_idx=article_idx,
                     max_new_tokens=max_new_tokens,

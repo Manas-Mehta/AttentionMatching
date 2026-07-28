@@ -1344,6 +1344,104 @@ def compute_perplexity_on_compacted_cache(
     return perplexity, log_perplexity
 
 
+def compute_gold_perplexity_on_cache_verbose(
+    model,
+    tokenizer,
+    compacted_cache: Tuple,
+    question_text: str,
+    gold_text: str,
+    device: str = "cuda",
+    original_seq_len: Optional[int] = None,
+) -> dict:
+    """
+    Teacher-forced perplexity of a GOLD answer string under a compacted cache,
+    returning the PER-TOKEN NLL profile (not just the mean).
+
+    Mirrors compute_perplexity_on_ground_truth_with_cache but uses
+    CrossEntropyLoss(reduction='none') so we can see WHICH gold tokens the
+    compressed cache is uncertain about (the "money plot" localizing where a
+    UUID gets corrupted).
+
+    Returns a dict with:
+        perplexity     : float        exp(mean NLL) over the gold tokens
+        log_perplexity : float        mean NLL (nats)
+        total_bits     : float        sum of per-token NLL / ln(2) = bits of surprise
+                                      over the whole gold string (0 = fully known)
+        num_tokens     : int
+        per_token_nll  : list[float]  NLL (nats) for each predicted gold token
+        per_token_ppl  : list[float]  exp(NLL) per token = 1 / P(true token)
+        token_strings  : list[str]    decoded gold token pieces (aligned to per_token_nll)
+    """
+    import math
+
+    question_token_ids = tokenizer.encode(question_text, add_special_tokens=False)
+    gold_token_ids = tokenizer.encode(gold_text, add_special_tokens=False)
+
+    empty = dict(perplexity=float("nan"), log_perplexity=float("nan"), total_bits=float("nan"),
+                 num_tokens=0, per_token_nll=[], per_token_ppl=[], token_strings=[])
+    if len(gold_token_ids) == 0:
+        return empty
+
+    full_token_ids = question_token_ids + gold_token_ids
+    full_token_ids_tensor = torch.tensor([full_token_ids], dtype=torch.long, device=device)
+
+    from models.cache import CompactedPrefixCache
+    from models.generate import get_sliding_layer_info
+
+    sliding_layer_indices, sliding_window = get_sliding_layer_info(model)
+    moved_layers = []
+    for (C1, beta, C2) in compacted_cache:
+        moved_layers.append((
+            C1.to(device=device, dtype=model.dtype),
+            beta.to(device=device, dtype=model.dtype),
+            C2.to(device=device, dtype=model.dtype),
+        ))
+    cache = CompactedPrefixCache(
+        tuple(moved_layers),
+        original_seq_len=original_seq_len,
+        sliding_layer_indices=sliding_layer_indices if sliding_layer_indices else None,
+        sliding_window=sliding_window,
+    )
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=full_token_ids_tensor,
+            past_key_values=cache,
+            use_cache=True,
+            return_dict=True,
+        )
+    logits = outputs.logits
+
+    # logits[num_question_tokens-1] predicts gold token 0, etc.
+    num_question_tokens = len(question_token_ids)
+    seq_len = full_token_ids_tensor.size(1)
+    start_idx = max(num_question_tokens - 1, 0)
+
+    answer_logits = logits[:, start_idx:seq_len - 1, :].contiguous()
+    answer_labels = full_token_ids_tensor[:, start_idx + 1:seq_len].contiguous()
+    if answer_labels.numel() == 0:
+        return empty
+
+    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+    per_token = loss_fct(answer_logits.view(-1, answer_logits.size(-1)), answer_labels.view(-1))
+    per_token_nll = per_token.detach().float().cpu().tolist()
+
+    mean_nll = float(sum(per_token_nll) / len(per_token_nll))
+    per_token_ppl = [float(math.exp(min(x, 60.0))) for x in per_token_nll]
+    token_strings = [tokenizer.decode([t]) for t in answer_labels.view(-1).tolist()]
+    total_bits = float(sum(per_token_nll) / math.log(2))
+
+    return dict(
+        perplexity=float(math.exp(min(mean_nll, 60.0))),
+        log_perplexity=mean_nll,
+        total_bits=total_bits,
+        num_tokens=len(per_token_nll),
+        per_token_nll=per_token_nll,
+        per_token_ppl=per_token_ppl,
+        token_strings=token_strings,
+    )
+
+
 def compute_perplexity_on_ground_truth_with_text(
     model,
     tokenizer,
