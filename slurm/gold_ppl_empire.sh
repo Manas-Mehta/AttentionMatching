@@ -2,6 +2,7 @@
 #SBATCH --job-name=gold_ppl
 #SBATCH --account=ny_gdurrett_training
 #SBATCH --partition=nyu               # nyu | alpha  -> same nodes (H100 alphagpu01-18)
+#SBATCH --exclude=alphagpu01,alphagpu02,alphagpu06,alphagpu08,alphagpu10,alphagpu11,alphagpu20,alphagpu24  # known-bad nodes (same list as ruler_sweep_empire.sh)
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=8
