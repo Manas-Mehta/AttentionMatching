@@ -22,9 +22,11 @@
 #   sbatch --export=ALL,TASK=niah_multikey_3,CTX=16k,TARGET_SIZE=0.0625,MAXLEN=40960 slurm/gold_ppl_empire.sh
 #
 # >>> VERIFY THESE TWO LINES match your Empire setup before first submit <<<
-SCRATCH="/mnt/home/DDN_Copy/nyu/mmehta"
+SCRATCH="/mnt/home/DDN_Copy/nyu/mmehta"  # miniforge, conda_envs, hf_cache live here
 CONDA_ENV="${SCRATCH}/conda_envs/am"     # path OR name of the 'am' env
-PROJECT_DIR="${SCRATCH}/AttentionMatching"
+# the repo lives in HOME (/mnt/home/mmehta/AttentionMatching), not scratch. Use the
+# dir sbatch was submitted from, falling back to HOME/AttentionMatching.
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$HOME/AttentionMatching}"
 
 set -eo pipefail
 set +u
