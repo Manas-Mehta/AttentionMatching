@@ -37,6 +37,7 @@ set -u
 
 export HF_HOME="${SCRATCH}/hf_cache"
 export HF_HUB_OFFLINE=1               # compute nodes have no internet — pre-stage the model first
+export HF_DATASETS_OFFLINE=1          # same for the RULER dataset load
 export TOKENIZERS_PARALLELISM=false
 
 cd "${PROJECT_DIR}"
