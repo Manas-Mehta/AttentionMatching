@@ -18,8 +18,9 @@ set -eo pipefail
 CTX="${CTX:-4k}"
 TASK="${TASK:-niah_single_3}"
 TARGET_SIZE="${TARGET_SIZE:-0.25}"     # 0.25 = 4x, 0.125 = 8x, 0.0625 = 16x
-N="${N:-8}"
+N="${N:-10}"
 MAXLEN="${MAXLEN:-16384}"
+CACHE_STORE="${CACHE_STORE:-}"         # if set, save each compacted cache here for reuse
 
 # ratio label for the output dir (0.25->4x etc.)
 case "$TARGET_SIZE" in
@@ -47,4 +48,5 @@ python -u -m evaluation.run_qa_evaluation \
   --max-ratio-per-head 0.95 \
   --compute-perplexity 0 \
   --compute-gold-perplexity 1 \
-  --compute-stats 0
+  --compute-stats 0 \
+  --cache-store-dir "${CACHE_STORE}"

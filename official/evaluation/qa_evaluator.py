@@ -363,6 +363,7 @@ class QAEvaluator:
         verbose_logging: bool = False,
         compute_perplexity: bool = False,
         compute_gold_perplexity: bool = False,
+        cache_store_dir: Optional[str] = None,
         perplexity_only: bool = False,
         article_idx: int = 0,
         max_new_tokens: int = 2048,
@@ -683,6 +684,36 @@ class QAEvaluator:
                     layer[0].numel() + layer[1].numel() + layer[2].numel()
                     for layer in compacted_cache
                 )
+
+            # [cache-store] Persist the compacted cache so future perplexity-metric
+            # experiments can reuse it without re-paying the (dominant) compaction cost.
+            # Compaction is deterministic and independent of which metric we later compute
+            # on top, so a saved cache is valid for any downstream teacher-forcing.
+            if cache_store_dir:
+                try:
+                    import os as _os
+                    _task = ((article_data.get('questions') or [{}])[0]).get('task', 'unknown')
+                    _mshort = compaction_method.name().replace('/', '_')
+                    _model_short = self.model_name.split('/')[-1]
+                    _artid = article_data.get('article_id', f'art{article_idx}')
+                    _dir = _os.path.join(cache_store_dir, _model_short, _task)
+                    _os.makedirs(_dir, exist_ok=True)
+                    _path = _os.path.join(_dir, f"{_artid}__ts{target_size:g}__{_mshort}.pt")
+                    _blob = {
+                        'compacted_cache': tuple(
+                            tuple(t.detach().to('cpu') for t in layer) for layer in compacted_cache
+                        ),
+                        'seq_len': int(seq_len),
+                        'article_id': _artid,
+                        'task': _task,
+                        'target_size': float(target_size),
+                        'method': compaction_method.name(),
+                        'model_name': self.model_name,
+                    }
+                    torch.save(_blob, _path)
+                    print(f"[cache-store] saved compacted cache -> {_path}")
+                except Exception as _e:
+                    print(f"[cache-store] WARNING: failed to save compacted cache: {_e}")
 
             reported_tensor_len = compaction_stats.get('tensor_compacted_seq_len')
             # Compute average tensor length across all global (non-sliding) layers
@@ -2154,6 +2185,7 @@ class QAEvaluator:
         verbose_logging: bool = False,
         compute_perplexity: bool = False,
         compute_gold_perplexity: bool = False,
+        cache_store_dir: Optional[str] = None,
         perplexity_only: bool = False,
         method_kwargs: Optional[Dict[str, Dict]] = None,
         log_dir: str = 'logs/qa_evaluation',
@@ -2325,6 +2357,7 @@ class QAEvaluator:
                     verbose_logging=verbose_logging,
                     compute_perplexity=compute_perplexity,
                     compute_gold_perplexity=compute_gold_perplexity,
+                    cache_store_dir=cache_store_dir,
                     perplexity_only=perplexity_only,
                     article_idx=article_idx,
                     max_new_tokens=max_new_tokens,

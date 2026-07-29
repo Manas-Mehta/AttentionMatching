@@ -153,6 +153,14 @@ def main():
              'with a per-gold-token NLL profile. Independent of --compute-perplexity. '
              '1 to enable, 0 to disable (default: 0)'
     )
+    parser.add_argument(
+        '--cache-store-dir',
+        type=str,
+        default=None,
+        help='If set, save each compacted KV cache under this directory '
+             '(keyed by model/task/article/target-size) so future perplexity-metric '
+             'experiments can reuse it without re-running the expensive compaction.'
+    )
 
     # Model arguments
     parser.add_argument(
@@ -317,6 +325,7 @@ def main():
         verbose_logging=bool(args.verbose_logging),
         compute_perplexity=bool(args.compute_perplexity or args.perplexity_only),
         compute_gold_perplexity=bool(args.compute_gold_perplexity),
+        cache_store_dir=args.cache_store_dir,
         perplexity_only=bool(args.perplexity_only),
         method_kwargs=method_kwargs,
         log_dir=args.log_dir,

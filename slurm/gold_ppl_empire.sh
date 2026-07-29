@@ -40,6 +40,8 @@ export HF_HOME="${SCRATCH}/hf_cache"
 export HF_HUB_OFFLINE=1               # compute nodes have no internet — pre-stage the model first
 export HF_DATASETS_OFFLINE=1          # same for the RULER dataset load
 export TOKENIZERS_PARALLELISM=false
+# where to persist compacted KV caches for reuse (override via --export=ALL,CACHE_STORE=...)
+export CACHE_STORE="${CACHE_STORE:-${SCRATCH}/compacted_cache_store}"
 
 cd "${PROJECT_DIR}"
 mkdir -p slurm_logs results
