@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:1                  # 1 GPU is plenty: 4B model + 4k ctx
-#SBATCH --time=04:00:00               # 4k n=50 finishes in ~25 min; job exits when done, so this
-                                      # generous window only guards against a slow node / kill — no runtime cost
+#SBATCH --time=01:30:00               # 4k n=50 finishes in ~25 min; ~3x headroom guards a slow node
+                                      # from a kill (job exits when done, so the window has no runtime cost)
 #SBATCH --output=slurm_logs/keylen_%j.out
 #SBATCH --error=slurm_logs/keylen_%j.err
 #
