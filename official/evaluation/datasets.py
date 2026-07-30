@@ -1123,8 +1123,11 @@ def is_perplexity_dataset(dataset_name: str) -> bool:
     return any(dataset_name.startswith(prefix) for prefix in PERPLEXITY_DATASET_PREFIXES)
 
 
-# Datasets that use string-match evaluation (RULER benchmark)
-RULER_DATASET_PREFIX = 'ruler'
+# Datasets that use string-match evaluation + gold perplexity (RULER benchmark,
+# plus the 'keylen' sweep — real RULER niah_single_3 docs with the key swapped, so
+# it must go down the same RULER scoring / gold-perplexity path, not the MCQ path).
+RULER_DATASET_PREFIXES = ('ruler', 'keylen')
+RULER_DATASET_PREFIX = RULER_DATASET_PREFIXES[0]  # back-compat for any external refs
 
 
 def is_ruler_dataset(dataset_name: str) -> bool:
@@ -1145,7 +1148,7 @@ def is_ruler_dataset(dataset_name: str) -> bool:
     bool
         True if the dataset uses RULER-style evaluation
     """
-    return dataset_name.startswith(RULER_DATASET_PREFIX)
+    return dataset_name.startswith(RULER_DATASET_PREFIXES)
 
 
 # Datasets that use token F1 evaluation (QASPER benchmark)
