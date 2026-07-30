@@ -69,11 +69,22 @@ def make_key(rng, bits):
     return "".join(rng.choice(HEX) for _ in range(bits // 4))
 
 
+def fmt_uuid_dashes(hexstr):
+    """32 hex chars -> canonical 8-4-4-4-12 UUID layout (dashes carry zero entropy)."""
+    if len(hexstr) != 32:
+        sys.exit(f"--dash needs 128-bit (32-hex) keys, got {len(hexstr)} hex chars")
+    return f"{hexstr[:8]}-{hexstr[8:12]}-{hexstr[12:16]}-{hexstr[16:20]}-{hexstr[20:]}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=50, help="documents per bit-length")
     ap.add_argument("--bits", type=int, nargs="+", default=[16, 32, 64, 96])
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--dash", action="store_true",
+                    help="format keys as dashed UUIDs (8-4-4-4-12); requires --bits 128. "
+                         "Same seed+bits as the bare run reuses the identical keys, so bare-vs-dash "
+                         "isolates the dash/tokenization effect alone. Writes keylen_{bits}dash.jsonl.")
     ap.add_argument("--outdir", default=None, help="default: <repo>/official/data/keylen")
     args = ap.parse_args()
 
@@ -89,28 +100,32 @@ def main():
         if bits % 4 != 0:
             sys.exit(f"ERROR: bits must be a multiple of 4 (got {bits})")
         rng = random.Random(args.seed * 10000 + bits)  # independent per length, reproducible
+        suffix = "dash" if args.dash else ""
         out = []
         for r in rows:
             uuid = r["answer"][0]
             ctx = r["context"]
             if ctx.count(uuid) != 1:
                 sys.exit(f"ERROR: expected UUID exactly once, found {ctx.count(uuid)}")
-            key = make_key(rng, bits)
+            key = make_key(rng, bits)                       # bare hex (same draw for bare & --dash)
+            if args.dash:
+                key = fmt_uuid_dashes(key)                  # dashes only reformat; entropy unchanged
             new_ctx = ctx.replace(uuid, key)
             assert key in new_ctx and uuid not in new_ctx
             out.append({
                 "context": new_ctx,
-                "task": f"keylen_{bits}",
+                "task": f"keylen_{bits}{suffix}",
                 "question": r["question"],       # keyed by the word -> unchanged
                 "answer": [key],
                 "answer_prefix": r["answer_prefix"],
                 "max_new_tokens": r["max_new_tokens"],
             })
-        fp = outdir / f"keylen_{bits}.jsonl"
+        fp = outdir / f"keylen_{bits}{suffix}.jsonl"
         with open(fp, "w") as fh:
             for o in out:
                 fh.write(json.dumps(o) + "\n")
-        print(f"wrote {len(out):3d} rows -> {fp}   ({bits} bits = {bits//4} hex chars)")
+        label = f"{bits} bits, dashed UUID layout" if args.dash else f"{bits} bits = {bits//4} hex chars"
+        print(f"wrote {len(out):3d} rows -> {fp}   ({label})")
 
 
 if __name__ == "__main__":
