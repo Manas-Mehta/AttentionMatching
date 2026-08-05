@@ -363,6 +363,8 @@ class QAEvaluator:
         verbose_logging: bool = False,
         compute_perplexity: bool = False,
         compute_gold_perplexity: bool = False,
+        compute_repeat_loss: bool = False,
+        repeat_loss_dir: Optional[str] = None,
         cache_store_dir: Optional[str] = None,
         perplexity_only: bool = False,
         article_idx: int = 0,
@@ -1345,6 +1347,142 @@ class QAEvaluator:
                       f"AM={_mean('am_perplexity'):.3f}   none={_mean('none_perplexity'):.3f}   "
                       f"(n={len(gold_ppl_list)})")
 
+        # [repeat-prefill damage map] Per-token loss over the REPEAT-PREFILL target --
+        # the exact sequence AM harvests its fit queries from -- under three memories:
+        #   A: AM compacted cache   B: full context (ceiling)   C: no context (floor)
+        # Delta(i) = NLL_AM(i) - NLL_full(i) separates damage CAUSED by compaction from
+        # tokens that were simply unpredictable anyway; the normalized version
+        #   (NLL_AM - NLL_full) / (NLL_none - NLL_full)
+        # reads 0 = perfectly preserved, 1 = as if the model never read the context.
+        # Curves are index-aligned to article tokens, so they can later be correlated
+        # against AM's own per-query residual (base.py:787) on the same x-axis.
+        repeat_prefill_summary = None
+        if compute_repeat_loss and compacted_cache is not None:
+            import numpy as np
+            from .utils import compute_repeat_prefill_loss, locate_span_token_indices
+            from compaction.query_generation.conversation_specs import CONVERSATION_SPEC_REGISTRY
+
+            article_text = article_data['article']
+            # Reproduce the repeat-prefill prompt EXACTLY as self_study.py:509-523 builds it.
+            starter = CONVERSATION_SPEC_REGISTRY['repeat'].conversation_starter
+            answer_prompt = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": starter}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            if answer_prompt.startswith("<bos>"):
+                answer_prompt = answer_prompt[len("<bos>"):]
+            rp_ctx_text = format_context(self.tokenizer, article_text, model_name=self.model_name)
+            rp_osl = effective_seq_len if use_text_based_generation else seq_len
+
+            print(f"\n{'='*60}")
+            print(f"Repeat-prefill damage map  (AM cache | full-ctx ceiling | no-ctx floor)")
+            print(f"{'='*60}")
+
+            rp_am = compute_repeat_prefill_loss(
+                self.model, self.tokenizer, answer_prompt, article_text,
+                compacted_cache=compacted_cache, device=self.device, original_seq_len=rp_osl,
+            )
+            rp_full = compute_repeat_prefill_loss(
+                self.model, self.tokenizer, answer_prompt, article_text,
+                compacted_cache=None, context_text=rp_ctx_text, device=self.device,
+            )
+            rp_none = compute_repeat_prefill_loss(
+                self.model, self.tokenizer, answer_prompt, article_text,
+                compacted_cache=None, context_text="", device=self.device,
+            )
+
+            n_rp = min(rp_am['num_tokens'], rp_full['num_tokens'], rp_none['num_tokens'])
+            if n_rp > 0:
+                a = np.asarray(rp_am['per_token_nll'][:n_rp], dtype=np.float32)
+                f = np.asarray(rp_full['per_token_nll'][:n_rp], dtype=np.float32)
+                z = np.asarray(rp_none['per_token_nll'][:n_rp], dtype=np.float32)
+                delta = a - f
+                denom = z - f
+                norm = np.where(np.abs(denom) > 1e-6, delta / np.where(np.abs(denom) > 1e-6, denom, 1.0), np.nan)
+
+                # Locate every gold span (the needle) inside the article, in token indices
+                # of the SAME tokenization the curves use.
+                needles = []
+                for qi, q in enumerate(questions):
+                    for gold_str in (q.get('ruler_outputs', []) or []):
+                        loc = locate_span_token_indices(self.tokenizer, article_text, gold_str)
+                        if loc is not None and loc['token_start'] < n_rp:
+                            loc['gold'] = gold_str
+                            loc['question_id'] = q.get('question_id', qi)
+                            needles.append(loc)
+
+                needle_mask = np.zeros(n_rp, dtype=bool)
+                for loc in needles:
+                    needle_mask[loc['token_start']:min(loc['token_end'] + 1, n_rp)] = True
+
+                _stats = lambda v: dict(
+                    mean=float(np.nanmean(v)), median=float(np.nanmedian(v)),
+                    p90=float(np.nanpercentile(v, 90)), p99=float(np.nanpercentile(v, 99)),
+                    max=float(np.nanmax(v)),
+                )
+                rp_summary = {
+                    'num_tokens': int(n_rp),
+                    'num_prompt_tokens': rp_am['num_prompt_tokens'],
+                    'am_mean_nll': float(a.mean()), 'am_perplexity': rp_am['perplexity'],
+                    'full_mean_nll': float(f.mean()), 'full_perplexity': rp_full['perplexity'],
+                    'none_mean_nll': float(z.mean()), 'none_perplexity': rp_none['perplexity'],
+                    'am_total_bits': rp_am['total_bits'], 'full_total_bits': rp_full['total_bits'],
+                    'delta_stats': _stats(delta),
+                    'frac_tokens_delta_gt_0p1': float((delta > 0.1).mean()),
+                    'frac_tokens_delta_gt_1p0': float((delta > 1.0).mean()),
+                    'needles': needles,
+                    'needle_token_count': int(needle_mask.sum()),
+                }
+                if needle_mask.any():
+                    rp_summary['needle_delta_mean'] = float(delta[needle_mask].mean())
+                    rp_summary['needle_delta_max'] = float(delta[needle_mask].max())
+                    rp_summary['needle_norm_mean'] = float(np.nanmean(norm[needle_mask]))
+                    rp_summary['nonneedle_delta_mean'] = float(delta[~needle_mask].mean())
+                    # The headline number: how much worse is the needle than a typical token?
+                    rp_summary['needle_delta_ratio'] = float(
+                        rp_summary['needle_delta_mean'] / rp_summary['nonneedle_delta_mean']
+                    ) if abs(rp_summary['nonneedle_delta_mean']) > 1e-9 else float('nan')
+
+                # Per-token curves go to a compressed sidecar, not the JSON: 3 x ~16k
+                # float arrays per article would bloat the results file for no benefit,
+                # and analysis wants them as arrays anyway.
+                if repeat_loss_dir:
+                    rp_path = Path(repeat_loss_dir)
+                    rp_path.mkdir(parents=True, exist_ok=True)
+                    npz_file = rp_path / f"article{article_idx:05d}.npz"
+                    np.savez_compressed(
+                        npz_file,
+                        nll_am=a, nll_full=f, nll_none=z,
+                        token_ids=np.asarray(rp_am['target_token_ids'][:n_rp], dtype=np.int32),
+                        needle_mask=needle_mask,
+                        num_prompt_tokens=np.int32(rp_am['num_prompt_tokens']),
+                        article_idx=np.int32(article_idx),
+                    )
+                    rp_summary['per_token_file'] = str(npz_file)
+
+                repeat_prefill_summary = rp_summary
+
+                print(f"  tokens={n_rp}   AM ppl={rp_am['perplexity']:.3f}   "
+                      f"full={rp_full['perplexity']:.3f}   none={rp_none['perplexity']:.3f}")
+                print(f"  delta (AM-full) nats:  mean={rp_summary['delta_stats']['mean']:.4f}  "
+                      f"p90={rp_summary['delta_stats']['p90']:.4f}  "
+                      f"p99={rp_summary['delta_stats']['p99']:.4f}  "
+                      f"max={rp_summary['delta_stats']['max']:.3f}")
+                print(f"  tokens with delta>0.1: {rp_summary['frac_tokens_delta_gt_0p1']*100:.2f}%   "
+                      f"delta>1.0: {rp_summary['frac_tokens_delta_gt_1p0']*100:.2f}%")
+                if needle_mask.any():
+                    print(f"  NEEDLE ({rp_summary['needle_token_count']} tok):  "
+                          f"delta_mean={rp_summary['needle_delta_mean']:.4f}   "
+                          f"vs non-needle {rp_summary['nonneedle_delta_mean']:.4f}   "
+                          f"ratio={rp_summary['needle_delta_ratio']:.1f}x   "
+                          f"norm={rp_summary['needle_norm_mean']:.3f}")
+                else:
+                    print(f"  (no gold span located in article text)")
+            else:
+                print(f"  [repeat-loss] skipped: no target tokens")
+
         # Compute accuracy metrics
         if is_perplexity_eval:
             # Perplexity-based dataset: no accuracy metrics, just perplexity
@@ -1573,6 +1711,10 @@ class QAEvaluator:
             'compaction_stats': compaction_stats,
             'qa_results': qa_results,
         }
+
+        # Add the repeat-prefill damage map summary (per-token curves live in the npz sidecar)
+        if repeat_prefill_summary is not None:
+            results['repeat_prefill_loss'] = repeat_prefill_summary
 
         # Add perplexity if computed
         if avg_perplexity is not None:
@@ -2185,6 +2327,7 @@ class QAEvaluator:
         verbose_logging: bool = False,
         compute_perplexity: bool = False,
         compute_gold_perplexity: bool = False,
+        compute_repeat_loss: bool = False,
         cache_store_dir: Optional[str] = None,
         perplexity_only: bool = False,
         method_kwargs: Optional[Dict[str, Dict]] = None,
@@ -2357,6 +2500,11 @@ class QAEvaluator:
                     verbose_logging=verbose_logging,
                     compute_perplexity=compute_perplexity,
                     compute_gold_perplexity=compute_gold_perplexity,
+                    compute_repeat_loss=compute_repeat_loss,
+                    repeat_loss_dir=(
+                        str(Path(log_dir) / 'repeat_loss' / method_name)
+                        if compute_repeat_loss else None
+                    ),
                     cache_store_dir=cache_store_dir,
                     perplexity_only=perplexity_only,
                     article_idx=article_idx,

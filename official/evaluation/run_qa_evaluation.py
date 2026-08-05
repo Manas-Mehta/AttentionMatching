@@ -154,6 +154,15 @@ def main():
              '1 to enable, 0 to disable (default: 0)'
     )
     parser.add_argument(
+        '--compute-repeat-loss',
+        type=int,
+        default=0,
+        help='Per-token loss over the REPEAT-PREFILL target (the sequence AM harvests its '
+             'fit queries from) under the AM cache, plus full-context (ceiling) and '
+             'no-context (floor) baselines. Writes a per-article npz of the three NLL '
+             'curves under <log-dir>/repeat_loss/<method>/. 1 to enable (default: 0)'
+    )
+    parser.add_argument(
         '--cache-store-dir',
         type=str,
         default=None,
@@ -325,6 +334,7 @@ def main():
         verbose_logging=bool(args.verbose_logging),
         compute_perplexity=bool(args.compute_perplexity or args.perplexity_only),
         compute_gold_perplexity=bool(args.compute_gold_perplexity),
+        compute_repeat_loss=bool(args.compute_repeat_loss),
         cache_store_dir=args.cache_store_dir,
         perplexity_only=bool(args.perplexity_only),
         method_kwargs=method_kwargs,

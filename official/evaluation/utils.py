@@ -1442,6 +1442,212 @@ def compute_gold_perplexity_on_cache_verbose(
     )
 
 
+def locate_span_token_indices(tokenizer, text: str, span: str) -> Optional[dict]:
+    """
+    Locate a literal substring (e.g. the gold UUID / needle) inside `text` and map it
+    to token indices under `tokenizer(text, add_special_tokens=False)`.
+
+    Used to mark WHERE the needle sits on the repeat-prefill damage curve. The token
+    indices returned are directly comparable to indices into the target segment of
+    compute_repeat_prefill_loss, because that function tokenizes the target standalone
+    with the same settings.
+
+    Returns None if the span is not found. Otherwise a dict with:
+        char_start, char_end     : character offsets of the FIRST occurrence
+        token_start, token_end   : inclusive token index range covering the span
+        n_tokens                 : token_end - token_start + 1
+        n_occurrences            : how many times the span appears in `text`
+    """
+    if not span:
+        return None
+    char_start = text.find(span)
+    if char_start < 0:
+        return None
+    char_end = char_start + len(span)
+
+    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc['offset_mapping']
+
+    token_start = None
+    token_end = None
+    for i, (a, b) in enumerate(offsets):
+        if b <= a:           # empty/special token, no character span
+            continue
+        if b > char_start and a < char_end:
+            if token_start is None:
+                token_start = i
+            token_end = i
+    if token_start is None:
+        return None
+
+    return dict(
+        char_start=char_start,
+        char_end=char_end,
+        token_start=int(token_start),
+        token_end=int(token_end),
+        n_tokens=int(token_end - token_start + 1),
+        n_occurrences=text.count(span),
+    )
+
+
+def compute_repeat_prefill_loss(
+    model,
+    tokenizer,
+    prompt_text: str,
+    target_text: str,
+    compacted_cache: Optional[Tuple] = None,
+    context_text: Optional[str] = None,
+    device: str = "cuda",
+    original_seq_len: Optional[int] = None,
+    chunk_size: int = 1024,
+) -> dict:
+    """
+    Per-token teacher-forced NLL over the REPEAT-PREFILL target, under one of three
+    memories. This is the instrument for "evaluate the loss over the RULER
+    repeat-prefill queries using the AM compressed cache".
+
+    The repeat-prefill sequence that AM harvests its fit queries from is
+        formatted_context + answer_prompt + article          (self_study.py:427/523)
+    i.e. the model is shown the article, asked to "Repeat the previous context
+    verbatim.", and the article is glued back on as the answer. This function scores
+    that third segment token by token, so index i of the returned curve is article
+    token i.
+
+    Memory is selected by the arguments:
+        compacted_cache set              -> AM compacted cache      (the measurement)
+        compacted_cache None, context_text=<article ctx> -> full context (ceiling)
+        compacted_cache None, context_text="" or None    -> no context  (floor)
+
+    Teacher forcing (not free generation) is deliberate: the sequence is reset to the
+    true article after every token, so each position gets an INDEPENDENT verdict. Under
+    free generation one slip early on would corrupt every later position and fresh
+    damage would be indistinguishable from knock-on damage.
+
+    Cross-entropy is computed in chunks over the sequence. The naive path materializes
+    a (seq_len, vocab) float32 tensor -- at 16k context that is ~32k x 151936 x 4B
+    ~ 19 GB just for the upcast copy. Chunking bounds it to chunk_size x vocab.
+
+    Returns a dict with:
+        mean_nll, perplexity, total_bits, num_tokens
+        per_token_nll      : list[float]  NLL (nats) per target token, index-aligned
+                                          to the target segment's tokenization
+        target_token_ids   : list[int]    the target tokens themselves
+        num_prompt_tokens  : int          length of answer_prompt, for mapping these
+                                          indices back onto AM's query indices
+        num_prefix_tokens  : int          tokens before the target in this forward pass
+    """
+    import math
+
+    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False) if prompt_text else []
+    target_ids = tokenizer.encode(target_text, add_special_tokens=False)
+    ctx_ids = tokenizer.encode(context_text, add_special_tokens=False) if context_text else []
+
+    empty = dict(mean_nll=float("nan"), perplexity=float("nan"), total_bits=float("nan"),
+                 num_tokens=0, per_token_nll=[], target_token_ids=[],
+                 num_prompt_tokens=len(prompt_ids), num_prefix_tokens=0)
+    if len(target_ids) == 0:
+        return empty
+
+    full_ids = ctx_ids + prompt_ids + target_ids
+    n_prefix = len(ctx_ids) + len(prompt_ids)
+    input_ids = torch.tensor([full_ids], dtype=torch.long, device=device)
+    seq_len = input_ids.size(1)
+
+    cache = None
+    if compacted_cache is not None:
+        from models.cache import CompactedPrefixCache
+        from models.generate import get_sliding_layer_info
+
+        sliding_layer_indices, sliding_window = get_sliding_layer_info(model)
+        moved_layers = []
+        for (C1, beta, C2) in compacted_cache:
+            moved_layers.append((
+                C1.to(device=device, dtype=model.dtype),
+                beta.to(device=device, dtype=model.dtype),
+                C2.to(device=device, dtype=model.dtype),
+            ))
+        cache = CompactedPrefixCache(
+            tuple(moved_layers),
+            original_seq_len=original_seq_len,
+            sliding_layer_indices=sliding_layer_indices if sliding_layer_indices else None,
+            sliding_window=sliding_window,
+        )
+
+    # logits[t] predicts token t+1, so target token j (absolute index n_prefix + j)
+    # is predicted by position n_prefix + j - 1.
+    start_idx = max(n_prefix - 1, 0)
+    if start_idx >= seq_len - 1:
+        return empty
+
+    lm_head = getattr(model, 'lm_head', None) or model.get_output_embeddings()
+    decoder = model.get_decoder() if hasattr(model, 'get_decoder') else getattr(model, 'model', None)
+
+    per_token_nll: List[float] = []
+    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+
+    def _chunked_nll_from_hidden(hidden):
+        out = []
+        for s in range(start_idx, seq_len - 1, chunk_size):
+            e = min(s + chunk_size, seq_len - 1)
+            lg = lm_head(hidden[:, s:e, :]).float()
+            lb = input_ids[:, s + 1:e + 1]
+            nll = loss_fct(lg.reshape(-1, lg.size(-1)), lb.reshape(-1))
+            out.extend(nll.detach().float().cpu().tolist())
+            del lg, nll
+        return out
+
+    with torch.no_grad():
+        used_fallback = False
+        if decoder is not None and lm_head is not None:
+            try:
+                dec_out = decoder(
+                    input_ids=input_ids,
+                    past_key_values=cache,
+                    use_cache=cache is not None,
+                    return_dict=True,
+                )
+                per_token_nll = _chunked_nll_from_hidden(dec_out.last_hidden_state)
+                del dec_out
+            except Exception as exc:          # noqa: BLE001 - fall back to the full head
+                print(f"    [repeat-loss] decoder-only path failed ({type(exc).__name__}: {exc}); "
+                      f"falling back to full forward")
+                used_fallback = True
+        else:
+            used_fallback = True
+
+        if used_fallback:
+            outputs = model(
+                input_ids=input_ids,
+                past_key_values=cache,
+                use_cache=cache is not None,
+                return_dict=True,
+            )
+            logits = outputs.logits
+            for s in range(start_idx, seq_len - 1, chunk_size):
+                e = min(s + chunk_size, seq_len - 1)
+                lg = logits[:, s:e, :].float()
+                lb = input_ids[:, s + 1:e + 1]
+                nll = loss_fct(lg.reshape(-1, lg.size(-1)), lb.reshape(-1))
+                per_token_nll.extend(nll.detach().float().cpu().tolist())
+                del lg, nll
+            del outputs, logits
+
+    if not per_token_nll:
+        return empty
+
+    mean_nll = float(sum(per_token_nll) / len(per_token_nll))
+    return dict(
+        mean_nll=mean_nll,
+        perplexity=float(math.exp(min(mean_nll, 60.0))),
+        total_bits=float(sum(per_token_nll) / math.log(2)),
+        num_tokens=len(per_token_nll),
+        per_token_nll=per_token_nll,
+        target_token_ids=[int(t) for t in target_ids[:len(per_token_nll)]],
+        num_prompt_tokens=len(prompt_ids),
+        num_prefix_tokens=n_prefix,
+    )
+
+
 def compute_perplexity_on_ground_truth_with_text(
     model,
     tokenizer,
