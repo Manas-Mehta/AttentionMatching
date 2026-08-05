@@ -77,9 +77,8 @@ def summarize(arts, window: int, n_buckets: int):
             'am_ppl': float(np.exp(a['am'].mean())),
             'full_ppl': float(np.exp(a['full'].mean())),
             'none_ppl': float(np.exp(a['none'].mean())),
-            'needle_norm': float(np.mean(
-                (delta[m]) / np.maximum(a['none'][m] - a['full'][m], 1e-6)
-            )),
+            'needle_norm': (float(delta[m].sum() / (a['none'][m] - a['full'][m]).sum())
+                            if abs((a['none'][m] - a['full'][m]).sum()) > 1e-6 else float('nan')),
         })
     out['per_article'] = per_article
 
@@ -131,7 +130,10 @@ def summarize(arts, window: int, n_buckets: int):
             'info_lo': float(edges[b]), 'info_hi': float(edges[b + 1]),
             'n': int(sel.sum()),
             'delta_mean': float(delta_all[sel].mean()),
-            'norm_mean': float(np.mean(delta_all[sel] / np.maximum(info_all[sel], 1e-6))),
+            # ratio of sums, not mean of ratios -- tokens with info ~0 (punctuation,
+            # fixed UUID hyphen positions) otherwise blow the average up
+            'norm_mean': (float(delta_all[sel].sum() / info_all[sel].sum())
+                          if abs(info_all[sel].sum()) > 1e-6 else float('nan')),
             'pct_needle': float(needle_all[sel].mean() * 100),
         })
     out['info_buckets'] = rows

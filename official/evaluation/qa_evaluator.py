@@ -1438,7 +1438,12 @@ class QAEvaluator:
                 if needle_mask.any():
                     rp_summary['needle_delta_mean'] = float(delta[needle_mask].mean())
                     rp_summary['needle_delta_max'] = float(delta[needle_mask].max())
-                    rp_summary['needle_norm_mean'] = float(np.nanmean(norm[needle_mask]))
+                    # Ratio of sums, NOT mean of per-token ratios: UUID hyphens sit at fixed
+                    # positions so their (none - full) denominator is ~0, and averaging the
+                    # per-token ratios lets those explode and dominate.
+                    _num = float(delta[needle_mask].sum())
+                    _den = float(denom[needle_mask].sum())
+                    rp_summary['needle_norm_mean'] = float(_num / _den) if abs(_den) > 1e-6 else float('nan')
                     rp_summary['nonneedle_delta_mean'] = float(delta[~needle_mask].mean())
                     # The headline number: how much worse is the needle than a typical token?
                     rp_summary['needle_delta_ratio'] = float(
