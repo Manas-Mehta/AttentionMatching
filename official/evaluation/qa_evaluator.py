@@ -2506,8 +2506,11 @@ class QAEvaluator:
                     compute_perplexity=compute_perplexity,
                     compute_gold_perplexity=compute_gold_perplexity,
                     compute_repeat_loss=compute_repeat_loss,
+                    # experiment_name (== the RULER task) MUST be in the path: several
+                    # tasks share a <ctx>/<ratio> log dir and would otherwise overwrite
+                    # each other's per-article npz sidecars.
                     repeat_loss_dir=(
-                        str(Path(log_dir) / 'repeat_loss' / method_name)
+                        str(Path(log_dir) / 'repeat_loss' / (experiment_name or 'run') / method_name)
                         if compute_repeat_loss else None
                     ),
                     cache_store_dir=cache_store_dir,

@@ -37,8 +37,10 @@ def load_cell(results_dir: Path):
     if not rl_root.is_dir():
         sys.exit(f"no repeat_loss/ under {results_dir} -- was --compute-repeat-loss 1 set?")
 
+    # layout: <results_dir>/repeat_loss/<task>/<method>/article*.npz
     cells = {}
-    for method_dir in sorted(p for p in rl_root.iterdir() if p.is_dir()):
+    method_dirs = [p for p in rl_root.rglob('*') if p.is_dir() and any(p.glob('article*.npz'))]
+    for method_dir in sorted(method_dirs):
         arts = []
         for f in sorted(method_dir.glob('article*.npz')):
             d = np.load(f)
@@ -51,7 +53,7 @@ def load_cell(results_dir: Path):
                 'article_idx': int(d['article_idx']),
             })
         if arts:
-            cells[method_dir.name] = arts
+            cells[str(method_dir.relative_to(rl_root))] = arts
     if not cells:
         sys.exit(f"found {rl_root} but no article*.npz inside")
     return cells
