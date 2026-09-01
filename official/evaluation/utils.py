@@ -1423,8 +1423,23 @@ def compute_gold_perplexity_on_cache_verbose(
         return empty
 
     loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-    per_token = loss_fct(answer_logits.view(-1, answer_logits.size(-1)), answer_labels.view(-1))
+    _flat_logits = answer_logits.view(-1, answer_logits.size(-1)).float()
+    _flat_labels = answer_labels.view(-1)
+    per_token = loss_fct(_flat_logits, _flat_labels)
     per_token_nll = per_token.detach().float().cpu().tolist()
+
+    # What the model actually believed here. NLL only gives P(gold); greedy
+    # correctness is decided by RANK, and "low probability but still the top
+    # choice" is a candidate explanation for spike-but-correct.
+    _probs = torch.softmax(_flat_logits, dim=-1)
+    _gold_logit = _flat_logits.gather(1, _flat_labels.unsqueeze(1))
+    gold_rank = (_flat_logits > _gold_logit).sum(dim=1).add(1).detach().cpu().tolist()
+    gold_prob = [float(x) for x in
+                 _probs.gather(1, _flat_labels.unsqueeze(1)).squeeze(1).detach().cpu().tolist()]
+    _tp, _ti = torch.topk(_probs, k=min(3, _probs.size(-1)), dim=-1)
+    top3_probs = [[float(x) for x in row] for row in _tp.detach().cpu().tolist()]
+    top3_tokens = [[tokenizer.decode([int(t)]) for t in row]
+                   for row in _ti.detach().cpu().tolist()]
 
     mean_nll = float(sum(per_token_nll) / len(per_token_nll))
     per_token_ppl = [float(math.exp(min(x, 60.0))) for x in per_token_nll]
@@ -1439,6 +1454,10 @@ def compute_gold_perplexity_on_cache_verbose(
         per_token_nll=per_token_nll,
         per_token_ppl=per_token_ppl,
         token_strings=token_strings,
+        gold_rank=gold_rank,
+        gold_prob=gold_prob,
+        top3_tokens=top3_tokens,
+        top3_probs=top3_probs,
     )
 
 
@@ -1738,6 +1757,82 @@ def compute_perplexity_on_ground_truth_with_text(
     num_tokens = answer_labels.numel()
 
     return perplexity, log_perplexity, num_tokens
+
+
+def compute_gold_perplexity_on_text_verbose(
+    model,
+    tokenizer,
+    context_text: str,
+    question_text: str,
+    gold_text: str,
+    device: str = "cuda",
+) -> dict:
+    """
+    Per-token teacher-forced NLL of a gold answer given a TEXT context.
+
+    Mirrors compute_gold_perplexity_on_cache_verbose (which uses a compacted cache)
+    so the AM curve and the full-context ceiling curve are position-aligned and
+    delta = nll_am - nll_full can be taken per token. context_text="" gives the
+    no-context floor.
+
+    Returns the same keys as the cache variant.
+    """
+    import math
+
+    context_token_ids = tokenizer.encode(context_text, add_special_tokens=False) if context_text else []
+    question_token_ids = tokenizer.encode(question_text, add_special_tokens=False)
+    gold_token_ids = tokenizer.encode(gold_text, add_special_tokens=False)
+
+    empty = dict(perplexity=float("nan"), log_perplexity=float("nan"), total_bits=float("nan"),
+                 num_tokens=0, per_token_nll=[], per_token_ppl=[], token_strings=[])
+    if len(gold_token_ids) == 0:
+        return empty
+
+    full_token_ids = context_token_ids + question_token_ids + gold_token_ids
+    full_ids = torch.tensor([full_token_ids], dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        out = model(input_ids=full_ids, use_cache=False, return_dict=True)
+
+    num_prefix = len(context_token_ids) + len(question_token_ids)
+    seq_len = full_ids.size(1)
+    start_idx = max(num_prefix - 1, 0)
+
+    answer_logits = out.logits[:, start_idx:seq_len - 1, :].contiguous()
+    answer_labels = full_ids[:, start_idx + 1:seq_len].contiguous()
+    if answer_labels.numel() == 0:
+        return empty
+
+    loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+    _flat_logits = answer_logits.view(-1, answer_logits.size(-1)).float()
+    _flat_labels = answer_labels.view(-1)
+    per_token = loss_fct(_flat_logits, _flat_labels)
+    per_token_nll = [float(x) for x in per_token.detach().cpu().tolist()]
+    # What did the model actually believe here? NLL only gives P(gold);
+    # greedy correctness is decided by RANK.
+    _probs = torch.softmax(_flat_logits, dim=-1)
+    _gold_p = _probs.gather(1, _flat_labels.unsqueeze(1)).squeeze(1)
+    _gold_logit = _flat_logits.gather(1, _flat_labels.unsqueeze(1))
+    gold_rank = (_flat_logits > _gold_logit).sum(dim=1).add(1).detach().cpu().tolist()
+    _tp, _ti = torch.topk(_probs, k=min(3, _probs.size(-1)), dim=-1)
+    top3_probs = [[float(x) for x in row] for row in _tp.detach().cpu().tolist()]
+    top3_tokens = [[tokenizer.decode([int(t)]) for t in row]
+                   for row in _ti.detach().cpu().tolist()]
+    gold_prob = [float(x) for x in _gold_p.detach().cpu().tolist()]
+    mean_nll = sum(per_token_nll) / len(per_token_nll)
+    return dict(
+        perplexity=float(math.exp(mean_nll)),
+        log_perplexity=float(mean_nll),
+        total_bits=float(sum(per_token_nll) / math.log(2)),
+        num_tokens=len(per_token_nll),
+        per_token_nll=per_token_nll,
+        per_token_ppl=[float(math.exp(min(x, 60.0))) for x in per_token_nll],
+        token_strings=[tokenizer.decode([t]) for t in gold_token_ids],
+        gold_rank=gold_rank,
+        gold_prob=gold_prob,
+        top3_tokens=top3_tokens,
+        top3_probs=top3_probs,
+    )
 
 
 def compute_perplexity_on_ground_truth_with_cache(

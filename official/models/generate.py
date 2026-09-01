@@ -497,9 +497,16 @@ def generate_with_compacted_cache_batch(
     top_k: Optional[int] = None,
     top_p: Optional[float] = None,
     original_seq_len: Optional[int] = None,
+    greedy: bool = False,
 ) -> List[str]:
     """
     Batched generator using compacted cache + flex attention.
+
+    greedy=True takes the argmax at every step instead of sampling. NOTE: this
+    cannot be done by setting do_sample=False on the model's generation_config --
+    get_generation_params() only reads temperature/top_k/top_p when do_sample is
+    True, so turning it off makes all three fall back to defaults (temperature 1.0,
+    top_p 1.0), which is MORE random than the 0.7/0.8/20 we run today.
 
     This handles:
     1. Expanding the shared compacted prefix tensors to match the prompt batch size.
@@ -618,18 +625,20 @@ def generate_with_compacted_cache_batch(
 
     # Generate
     with torch.no_grad():
-        outputs = model.generate(
+        _gen_kwargs = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=cache,
             cache_position=cache_position,
             max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            pad_token_id=tokenizer.pad_token_id
+            pad_token_id=tokenizer.pad_token_id,
         )
+        if greedy:
+            _gen_kwargs['do_sample'] = False
+        else:
+            _gen_kwargs.update(do_sample=True, temperature=temperature,
+                               top_k=top_k, top_p=top_p)
+        outputs = model.generate(**_gen_kwargs)
 
     # Decode
     # outputs shape: (B, input_len + generated_len)

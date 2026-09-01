@@ -259,6 +259,39 @@ class QAEvaluator:
                 max_new_tokens=batch_max_new_tokens,
                 original_seq_len=seq_len,
             )
+            # [MULTISAMPLE] extra decoding passes off the SAME cache.
+            # answers[] above stays sample #1 at temperature 0.7 so existing
+            # results remain comparable. prompts * k gives k samples in one
+            # batched call; sample s of question i lands at index s*n + i.
+            import os as _os
+            _nsamp = int(_os.environ.get('AM_N_SAMPLES', '1'))
+            _greedy_on = _os.environ.get('AM_GREEDY', '0') == '1'
+            _nq = len(formatted_questions)
+            _greedy_answers = [None] * _nq
+            _sample_answers = [[a] for a in answers]
+
+            if _greedy_on:
+                _greedy_answers = generate_with_compacted_cache_batch(
+                    model=self.model, tokenizer=self.tokenizer,
+                    prompts=formatted_questions,
+                    compacted_cache=compacted_cache_gpu,
+                    max_new_tokens=batch_max_new_tokens,
+                    original_seq_len=seq_len, greedy=True,
+                )
+            if _nsamp > 1:
+                _extra = generate_with_compacted_cache_batch(
+                    model=self.model, tokenizer=self.tokenizer,
+                    prompts=formatted_questions * (_nsamp - 1),
+                    compacted_cache=compacted_cache_gpu,
+                    max_new_tokens=batch_max_new_tokens,
+                    original_seq_len=seq_len,
+                )
+                for _s in range(_nsamp - 1):
+                    for _i in range(_nq):
+                        _sample_answers[_i].append(_extra[_s * _nq + _i])
+            if _greedy_on or _nsamp > 1:
+                print(f"  [multisample] greedy={_greedy_on}  n_samples={_nsamp}")
+
             del compacted_cache_gpu
 
             gen_time = time.time() - gen_start_time
@@ -292,12 +325,28 @@ class QAEvaluator:
                     is_correct = score == 1.0
                     print(f"  RULER score: {score:.2f} | Task: {task} | Refs: {refs}")
 
+                    # [MULTISAMPLE] per-sample labels + the hit rate
+                    _samp = _sample_answers[i]
+                    _samp_ok = [ruler_score_prediction(a, refs, task) == 1.0 for a in _samp]
+                    _g_ans = _greedy_answers[i]
+                    _g_ok = (ruler_score_prediction(_g_ans, refs, task) == 1.0
+                             ) if _g_ans is not None else None
+                    if len(_samp) > 1 or _g_ans is not None:
+                        print(f"  [multisample] hit_rate={sum(_samp_ok)}/{len(_samp)}"
+                              f"  greedy_correct={_g_ok}")
+
                     question_result = {
                         'question_id': q.get('question_unique_id', f'q_{q_idx}'),
                         'question': q_text,
                         'task': task,
                         'ruler_outputs': refs,
                         'model_answer_text': answer,
+                        'sample_answers': _samp,
+                        'sample_is_correct': _samp_ok,
+                        'hit_rate': sum(_samp_ok) / len(_samp),
+                        'n_samples': len(_samp),
+                        'greedy_answer': _g_ans,
+                        'greedy_is_correct': _g_ok,
                         'ruler_score': score,
                         'is_correct': is_correct,
                         'generation_time': gen_time / actual_batch_size,
@@ -1295,6 +1344,7 @@ class QAEvaluator:
         if compute_gold_perplexity and is_ruler_eval and compacted_cache is not None:
             from .utils import (
                 compute_gold_perplexity_on_cache_verbose,
+                compute_gold_perplexity_on_text_verbose,
                 compute_perplexity_on_ground_truth_with_text,
             )
             full_ctx_text = format_context(self.tokenizer, article_data['article'], model_name=self.model_name)
@@ -1308,18 +1358,47 @@ class QAEvaluator:
                 if not refs:
                     continue
                 gold_str = refs[0]
-                qf = format_question(self.tokenizer, q['question'], q.get('options', None), self.model_name)
+                # [FIX A] Prime the prompt exactly as generation does
+                # (qa_evaluator.py:946-951). Without answer_prefix the model is
+                # not told the answer is starting, so gold tokens 0-2 measure
+                # format surprise, not compaction damage -- they spike just as
+                # hard at 4x (98% correct) as at 16x (24% correct).
+                _ap = q.get('answer_prefix', '') or ''
+                qf = format_question(
+                    self.tokenizer, q['question'], q.get('options', None),
+                    self.model_name,
+                    enable_thinking=(not _ap),
+                    answer_prefix=_ap,
+                )
+                # [FIX A3] supersedes FIX A2. The model does not merely want a
+                # SPACE before the uuid -- it emits a constant lead-in:
+                #     ': **'   in 312/319 correct greedy answers (146/146 at 4x)
+                # a colon, a space and a markdown bold marker. Priming with a bare
+                # space left ' **' as the argmax at gold position 0, which knocked
+                # gold off rank 1 under the FULL context on 20/50 articles -- all 20
+                # of which are greedy-CORRECT at 4x. That ceiling was measuring
+                # formatting, not memory. Condition on the real lead-in instead so
+                # position 0 scores the first uuid token from the state generation
+                # is actually in when it emits it.
+                import os as _os
+                _lead = _os.environ.get('AM_LEADIN')
+                if _lead is None:
+                    _lead = ': **'
+                qf = qf + _lead
 
                 am = compute_gold_perplexity_on_cache_verbose(
                     self.model, self.tokenizer, compacted_cache, qf, gold_str,
                     device=self.device, original_seq_len=gold_osl,
                 )
-                full_ppl, full_logppl, _ = compute_perplexity_on_ground_truth_with_text(
+                # [FIX B] verbose variants so delta = nll_am - nll_full exists PER TOKEN
+                _full = compute_gold_perplexity_on_text_verbose(
                     self.model, self.tokenizer, full_ctx_text, qf, gold_str, device=self.device,
                 )
-                none_ppl, none_logppl, _ = compute_perplexity_on_ground_truth_with_text(
+                _none = compute_gold_perplexity_on_text_verbose(
                     self.model, self.tokenizer, "", qf, gold_str, device=self.device,
                 )
+                full_ppl, full_logppl = _full['perplexity'], _full['log_perplexity']
+                none_ppl, none_logppl = _none['perplexity'], _none['log_perplexity']
                 gp = {
                     'question_id': q.get('question_id', i),
                     'gold': gold_str,
@@ -1333,6 +1412,15 @@ class QAEvaluator:
                     'num_gold_tokens': am['num_tokens'],
                     'am_per_token_nll': am['per_token_nll'],
                     'am_per_token_ppl': am['per_token_ppl'],
+                    'full_per_token_nll': _full['per_token_nll'],
+                    'none_per_token_nll': _none['per_token_nll'],
+                    'am_gold_rank': am.get('gold_rank'),
+                    'am_gold_prob': am.get('gold_prob'),
+                    'am_top3_tokens': am.get('top3_tokens'),
+                    'am_top3_probs': am.get('top3_probs'),
+                    'full_gold_rank': _full.get('gold_rank'),
+                    'none_gold_rank': _none.get('gold_rank'),
+                    'full_total_bits': _full['total_bits'],
                     'gold_token_strings': am['token_strings'],
                 }
                 if i < len(results_per_question):

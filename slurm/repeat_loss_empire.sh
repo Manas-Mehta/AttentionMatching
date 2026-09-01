@@ -2,6 +2,7 @@
 #SBATCH --job-name=repeat_loss
 #SBATCH --account=ny_gdurrett_training
 #SBATCH --partition=nyu               # nyu | alpha  -> same nodes (H100 alphagpu01-18)
+#SBATCH --qos=priority             # factor 1000 vs standard 500, max wall 1d; every run before 2026-08-12 used standard and queued for hours
 #SBATCH --exclude=alphagpu01,alphagpu02,alphagpu06,alphagpu08,alphagpu10,alphagpu11,alphagpu20,alphagpu24  # known-bad nodes
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -40,7 +41,7 @@ export HF_HOME="${SCRATCH}/hf_cache"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
-export CACHE_STORE="${CACHE_STORE:-${SCRATCH}/compacted_cache_store}"
+export CACHE_STORE="${CACHE_STORE:-}"   # empty = do NOT save compacted caches (59-180 MB/article); set a path to opt in
 
 cd "${PROJECT_DIR}"
 mkdir -p slurm_logs results
