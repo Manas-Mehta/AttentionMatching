@@ -278,6 +278,25 @@ class PerLayerHeadOnPolicyCompaction(FullCacheCompactionAlgorithm):
             'num_sliding_layers': len(sliding_layer_indices),
             'num_global_layers': num_global_layers,
         }
+        # [grid] Persist the self-study conversations the fit queries were harvested from
+        # (starter + sampled answer). Small text; lets the query vectors be regenerated
+        # later by one deterministic prefill instead of a full rerun. The repeat spec's
+        # "answer" is the article itself, so it is skipped. Under chunked compaction this
+        # rides along per chunk inside compaction_stats['chunk_stats'].
+        try:
+            from ..query_generation.conversation_specs import CONVERSATION_SPEC_REGISTRY as _SS_REG
+            _repeat_starter = _SS_REG['repeat'].conversation_starter
+            all_stats['self_study_texts'] = [
+                {
+                    'starter': s.get('starter'),
+                    'answer': (s.get('answer') or '')[:20000],
+                    'enable_thinking_b': s.get('enable_thinking_b'),
+                }
+                for s in (sequences or [])
+                if s.get('starter') != _repeat_starter
+            ]
+        except Exception as _e:  # bookkeeping must never break compaction
+            all_stats['self_study_texts_error'] = str(_e)
         # Track total effective article tokens across all heads for computing effective lengths
         total_effective_article_tokens = 0
 

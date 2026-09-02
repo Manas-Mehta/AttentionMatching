@@ -163,6 +163,23 @@ def main():
              'curves under <log-dir>/repeat_loss/<method>/. 1 to enable (default: 0)'
     )
     parser.add_argument(
+        '--compute-ss-loss',
+        type=int,
+        default=0,
+        help='Per-token teacher-forced loss over the SELF-STUDY prompts (summarize, aggregate, '
+             'structure_json, 3_question) under the AM cache, plus full-context (ceiling) and '
+             'no-context (floor) baselines. Gold = greedy, thinking-off generation under the full '
+             'context, cached on disk (--ss-gold-dir) and shared across runs. Writes a per-article '
+             'npz under <log-dir>/ss_loss/<name>/<method>/. 1 to enable (default: 0)'
+    )
+    parser.add_argument(
+        '--ss-gold-dir',
+        type=str,
+        default=None,
+        help='Directory for the cached self-study gold generations (see --compute-ss-loss). '
+             'Generated once per (model, task, article) and reused by every later run.'
+    )
+    parser.add_argument(
         '--cache-store-dir',
         type=str,
         default=None,
@@ -335,6 +352,8 @@ def main():
         compute_perplexity=bool(args.compute_perplexity or args.perplexity_only),
         compute_gold_perplexity=bool(args.compute_gold_perplexity),
         compute_repeat_loss=bool(args.compute_repeat_loss),
+        compute_ss_loss=bool(args.compute_ss_loss),
+        ss_gold_dir=args.ss_gold_dir,
         cache_store_dir=args.cache_store_dir,
         perplexity_only=bool(args.perplexity_only),
         method_kwargs=method_kwargs,

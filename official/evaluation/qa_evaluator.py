@@ -414,6 +414,9 @@ class QAEvaluator:
         compute_gold_perplexity: bool = False,
         compute_repeat_loss: bool = False,
         repeat_loss_dir: Optional[str] = None,
+        compute_ss_loss: bool = False,
+        ss_loss_dir: Optional[str] = None,
+        ss_gold_dir: Optional[str] = None,
         cache_store_dir: Optional[str] = None,
         perplexity_only: bool = False,
         article_idx: int = 0,
@@ -1576,6 +1579,172 @@ class QAEvaluator:
             else:
                 print(f"  [repeat-loss] skipped: no target tokens")
 
+        # [query-generalization grid] Self-study loss column.
+        # Same instrument as the repeat-prefill damage map, pointed at the 4 self-study
+        # prompts. For each spec, gold = the FULL-context model's greedy, thinking-off answer,
+        # generated ONCE, cached under ss_gold_dir and shared by every cache built on this
+        # article (cache-R / cache-S / cache-RS are scored on the identical string), then
+        # teacher-forced under A: AM cache  B: full context (ceiling)  C: no context (floor).
+        # 3_question is two-stage like training (questions from the seed prompt, then one
+        # answer per question); its loss pools the answers. Per-token curves go to an npz.
+        ss_loss_summary = None
+        if compute_ss_loss and compacted_cache is not None:
+            import hashlib as _hashlib
+            import json as _json
+            import os as _os_ss
+            import time as _time
+            import numpy as np
+            from .utils import compute_repeat_prefill_loss
+            from compaction.query_generation.conversation_specs import CONVERSATION_SPEC_REGISTRY
+
+            SS_SPECS = ['summarize', 'aggregate', 'structure_json', '3_question']
+            # Greedy answers stop at EOS well before these; the caps bound the worst case.
+            SS_MAX_NEW = {'summarize': 1024, 'aggregate': 1024, 'structure_json': 1024,
+                          '3_question_a': 512, '3_question_b': 512}
+            ss_article_text = article_data['article']
+            ss_ctx_text = format_context(self.tokenizer, ss_article_text, model_name=self.model_name)
+            ss_osl = effective_seq_len if use_text_based_generation else seq_len
+
+            def _ss_chat(user_text):
+                # Same construction as self_study.py:510-519 / the repeat block above.
+                p = self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": user_text}],
+                    tokenize=False, add_generation_prompt=True, enable_thinking=False,
+                )
+                return p[len("<bos>"):] if p.startswith("<bos>") else p
+
+            def _ss_greedy(prompt_text, max_new):
+                ids = self.tokenizer(prompt_text, return_tensors="pt",
+                                     add_special_tokens=False).input_ids.to(self.device)
+                with torch.no_grad():
+                    out = self.model.generate(
+                        ids, max_new_tokens=max_new, do_sample=False,
+                        pad_token_id=(self.tokenizer.pad_token_id
+                                      if self.tokenizer.pad_token_id is not None
+                                      else self.tokenizer.eos_token_id),
+                    )
+                return self.tokenizer.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+            # ---- gold: load from disk, else generate once under the full context ----
+            _ss_artid = str(article_data.get('article_id', f'art{article_idx}'))
+            _ss_task = ((article_data.get('questions') or [{}])[0]).get('task', 'unknown')
+            _ss_hash = _hashlib.sha1(ss_article_text.encode('utf-8')).hexdigest()[:12]
+            ss_gold = None
+            ss_gold_path = None
+            if ss_gold_dir:
+                _gdir = Path(ss_gold_dir) / self.model_name.split('/')[-1] / str(_ss_task)
+                _gdir.mkdir(parents=True, exist_ok=True)
+                ss_gold_path = _gdir / f"{_ss_artid}__{_ss_hash}.json"
+                if ss_gold_path.exists():
+                    try:
+                        with open(ss_gold_path) as _fh:
+                            ss_gold = _json.load(_fh)
+                    except Exception:
+                        ss_gold = None
+            if ss_gold is None:
+                _t0 = _time.time()
+                ss_gold = {'article_id': _ss_artid, 'article_sha1_12': _ss_hash, 'task': _ss_task,
+                           'model': self.model_name, 'decoding': 'greedy, enable_thinking=False',
+                           'max_new_tokens': SS_MAX_NEW, 'specs': {}}
+                for _spec_name in SS_SPECS:
+                    _spec = CONVERSATION_SPEC_REGISTRY[_spec_name]
+                    if _spec_name == '3_question':
+                        _qtext = _ss_greedy(ss_ctx_text + _ss_chat(_spec.seed_prompt), SS_MAX_NEW['3_question_a'])
+                        _qs = _spec.extraction_fn(_qtext) if _spec.extraction_fn else [_qtext]
+                        _qs = [q for q in _qs if q.strip()][:3] or ([_qtext.strip()] if _qtext.strip() else [])
+                        _items = []
+                        for _q in _qs:
+                            _a = _ss_greedy(ss_ctx_text + _ss_chat(_q), SS_MAX_NEW['3_question_b'])
+                            _items.append({'prompt': _q, 'answer': _a})
+                        ss_gold['specs'][_spec_name] = {'seed_prompt': _spec.seed_prompt,
+                                                        'raw_questions': _qtext, 'items': _items}
+                    else:
+                        _a = _ss_greedy(ss_ctx_text + _ss_chat(_spec.conversation_starter), SS_MAX_NEW[_spec_name])
+                        ss_gold['specs'][_spec_name] = {'items': [{'prompt': _spec.conversation_starter, 'answer': _a}]}
+                ss_gold['generation_time_s'] = _time.time() - _t0
+                if ss_gold_path is not None:
+                    _tmp = ss_gold_path.with_suffix('.json.tmp')
+                    with open(_tmp, 'w') as _fh:
+                        _json.dump(ss_gold, _fh)
+                    _os_ss.replace(_tmp, ss_gold_path)   # atomic: a concurrent reader never sees a half file
+                print(f"\n[ss-loss] gold generated in {ss_gold['generation_time_s']:.1f}s"
+                      + (f" -> {ss_gold_path}" if ss_gold_path else ""))
+            else:
+                print(f"\n[ss-loss] gold loaded from {ss_gold_path}")
+
+            # ---- score each spec under the three memories ----
+            print(f"{'='*60}")
+            print(f"Self-study loss  (AM cache | full-ctx ceiling | no-ctx floor)")
+            print(f"{'='*60}")
+            ss_loss_summary = {'gold_file': str(ss_gold_path) if ss_gold_path else None, 'specs': {}}
+            _npz = {}
+            for _spec_name in SS_SPECS:
+                _items = ss_gold['specs'].get(_spec_name, {}).get('items', [])
+                _A, _F, _Z, _T, _per_item = [], [], [], [], []
+                for _it in _items:
+                    if not (_it.get('answer') or '').strip():
+                        continue
+                    _ap = _ss_chat(_it['prompt'])
+                    _r_am = compute_repeat_prefill_loss(
+                        self.model, self.tokenizer, _ap, _it['answer'],
+                        compacted_cache=compacted_cache, device=self.device, original_seq_len=ss_osl,
+                    )
+                    _r_full = compute_repeat_prefill_loss(
+                        self.model, self.tokenizer, _ap, _it['answer'],
+                        compacted_cache=None, context_text=ss_ctx_text, device=self.device,
+                    )
+                    _r_none = compute_repeat_prefill_loss(
+                        self.model, self.tokenizer, _ap, _it['answer'],
+                        compacted_cache=None, context_text="", device=self.device,
+                    )
+                    _n = min(_r_am['num_tokens'], _r_full['num_tokens'], _r_none['num_tokens'])
+                    if _n <= 0:
+                        continue
+                    _a = np.asarray(_r_am['per_token_nll'][:_n], dtype=np.float32)
+                    _f = np.asarray(_r_full['per_token_nll'][:_n], dtype=np.float32)
+                    _z = np.asarray(_r_none['per_token_nll'][:_n], dtype=np.float32)
+                    _A.append(_a); _F.append(_f); _Z.append(_z)
+                    _T.append(np.asarray(_r_am['target_token_ids'][:_n], dtype=np.int32))
+                    _per_item.append({'num_tokens': int(_n), 'am_mean_nll': float(_a.mean()),
+                                      'full_mean_nll': float(_f.mean()), 'none_mean_nll': float(_z.mean())})
+                if not _A:
+                    ss_loss_summary['specs'][_spec_name] = {'num_tokens': 0, 'items': _per_item}
+                    print(f"  {_spec_name:15} (no target tokens)")
+                    continue
+                _a = np.concatenate(_A); _f = np.concatenate(_F); _z = np.concatenate(_Z)
+                _d = _a - _f
+                _den = _z - _f
+                _norm = float(_d.sum() / _den.sum()) if abs(float(_den.sum())) > 1e-6 else float('nan')
+                ss_loss_summary['specs'][_spec_name] = {
+                    'num_tokens': int(len(_a)), 'num_items': len(_per_item),
+                    'am_mean_nll': float(_a.mean()), 'full_mean_nll': float(_f.mean()),
+                    'none_mean_nll': float(_z.mean()),
+                    'delta_mean_nll': float(_d.mean()),
+                    'norm_damage': _norm,                      # 0 = preserved, 1 = as if never read
+                    'frac_tokens_delta_gt_1p0': float((_d > 1.0).mean()),
+                    'items': _per_item,
+                }
+                _npz[f'nll_am_{_spec_name}'] = _a
+                _npz[f'nll_full_{_spec_name}'] = _f
+                _npz[f'nll_none_{_spec_name}'] = _z
+                _npz[f'token_ids_{_spec_name}'] = np.concatenate(_T)
+                print(f"  {_spec_name:15} tok={len(_a):5d}  AM={_a.mean():.3f}  full={_f.mean():.3f}  "
+                      f"none={_z.mean():.3f}  delta={_d.mean():.3f}  norm={_norm:.3f}")
+            _valid = [s for s in ss_loss_summary['specs'].values() if s.get('num_tokens', 0) > 0]
+            if _valid:
+                ss_loss_summary['mean_delta_over_specs'] = float(np.mean([s['delta_mean_nll'] for s in _valid]))
+                _nt = sum(s['num_tokens'] for s in _valid)
+                ss_loss_summary['token_weighted_delta'] = float(
+                    sum(s['delta_mean_nll'] * s['num_tokens'] for s in _valid) / _nt)
+                print(f"  mean over specs: delta={ss_loss_summary['mean_delta_over_specs']:.3f}   "
+                      f"token-weighted: {ss_loss_summary['token_weighted_delta']:.3f}")
+            if ss_loss_dir and _npz:
+                _ss_path = Path(ss_loss_dir)
+                _ss_path.mkdir(parents=True, exist_ok=True)
+                _npz_file = _ss_path / f"article{article_idx:05d}.npz"
+                np.savez_compressed(_npz_file, article_idx=np.int32(article_idx), **_npz)
+                ss_loss_summary['per_token_file'] = str(_npz_file)
+
         # Compute accuracy metrics
         if is_perplexity_eval:
             # Perplexity-based dataset: no accuracy metrics, just perplexity
@@ -1808,6 +1977,9 @@ class QAEvaluator:
         # Add the repeat-prefill damage map summary (per-token curves live in the npz sidecar)
         if repeat_prefill_summary is not None:
             results['repeat_prefill_loss'] = repeat_prefill_summary
+        # Self-study loss column summary (per-token curves live in its own npz sidecar)
+        if ss_loss_summary is not None:
+            results['ss_loss'] = ss_loss_summary
 
         # Add perplexity if computed
         if avg_perplexity is not None:
@@ -2421,6 +2593,8 @@ class QAEvaluator:
         compute_perplexity: bool = False,
         compute_gold_perplexity: bool = False,
         compute_repeat_loss: bool = False,
+        compute_ss_loss: bool = False,
+        ss_gold_dir: Optional[str] = None,
         cache_store_dir: Optional[str] = None,
         perplexity_only: bool = False,
         method_kwargs: Optional[Dict[str, Dict]] = None,
@@ -2601,6 +2775,12 @@ class QAEvaluator:
                         str(Path(log_dir) / 'repeat_loss' / (experiment_name or 'run') / method_name)
                         if compute_repeat_loss else None
                     ),
+                    compute_ss_loss=compute_ss_loss,
+                    ss_loss_dir=(
+                        str(Path(log_dir) / 'ss_loss' / (experiment_name or 'run') / method_name)
+                        if compute_ss_loss else None
+                    ),
+                    ss_gold_dir=ss_gold_dir,
                     cache_store_dir=cache_store_dir,
                     perplexity_only=perplexity_only,
                     article_idx=article_idx,

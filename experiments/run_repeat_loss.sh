@@ -39,6 +39,10 @@ export AM_GREEDY="${GREEDY:-0}"       # 1 = also emit a deterministic argmax lab
 QCFG="${QCFG:-repeat}"               # query config: repeat | ss-plus-repeat | self-study | ss-5k ...
 RLOSS="${RLOSS:-1}"                  # 1 = also compute the repeat-prefill damage map (3 extra forwards/article)
 PPL="${PPL:-0}"                      # 1 = perplexity of the model's own full-cache answers (needs reference answers)
+SSLOSS="${SSLOSS:-1}"                # 1 = self-study loss column (4 specs under AM/full/none); gold cached in GOLD_DIR
+GOLD_DIR="${GOLD_DIR:-../results/ss_gold}"   # shared greedy self-study golds (path relative to official/)
+CHUNKING="${CHUNKING:-fixed}"        # fixed = paper default (4096-token chunks, then stitch); none = one block
+CHUNK_SIZE="${CHUNK_SIZE:-4096}"
 
 case "$TARGET_SIZE" in
   0.25)   RATIO=4x ;;
@@ -49,7 +53,7 @@ esac
 
 cd "$(dirname "$0")/../official"
 
-echo "=== ${TASK} ${CTX} ${RATIO}  n=${N}  qcfg=${QCFG}  rloss=${RLOSS}  stats=${STATS}  ppl=${PPL}  verbose=${VERBOSE}  cache_store=${CACHE_STORE:-<none>} ==="
+echo "=== ${TASK} ${CTX} ${RATIO}  n=${N}  qcfg=${QCFG}  chunking=${CHUNKING}/${CHUNK_SIZE}  rloss=${RLOSS}  ssloss=${SSLOSS}  stats=${STATS}  ppl=${PPL}  verbose=${VERBOSE}  nsamp=${AM_N_SAMPLES} greedy=${AM_GREEDY}  cache_store=${CACHE_STORE:-<none>}  gold_dir=${GOLD_DIR} ==="
 python -u -m evaluation.run_qa_evaluation \
   --model-name Qwen/Qwen3-4B-Instruct-2507 \
   --dataset-name "ruler_${CTX}_${TASK}" \
@@ -66,6 +70,10 @@ python -u -m evaluation.run_qa_evaluation \
   --compute-perplexity "${PPL}" \
   --compute-gold-perplexity 1 \
   --compute-repeat-loss "${RLOSS}" \
+  --compute-ss-loss "${SSLOSS}" \
+  --ss-gold-dir "${GOLD_DIR}" \
+  --chunking "${CHUNKING}" \
+  --chunk-size "${CHUNK_SIZE}" \
   --compute-stats "${STATS}" \
   --verbose-logging "${VERBOSE}" \
   --cache-store-dir "${CACHE_STORE}"
