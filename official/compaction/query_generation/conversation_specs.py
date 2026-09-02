@@ -191,6 +191,13 @@ CONVERSATION_SPEC_REGISTRY: Dict[str, ConversationSpec] = {
         enable_thinking_b=False,
         max_tokens_b=8192,
     ),
+    # Task-targeted (niah_single_3 / niah_multikey_3): pushes generated queries onto
+    # the keyword->value needles so AM keeps those keys. Deliberately oracle-ish.
+    "collect_keys": ConversationSpec(
+        conversation_starter="List every special keyword mentioned in the context, and for each, write out the exact value assigned to it.",
+        enable_thinking_b=False,
+        max_tokens_b=2048,
+    ),
 }
 
 
