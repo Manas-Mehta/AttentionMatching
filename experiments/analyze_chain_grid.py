@@ -75,36 +75,69 @@ def load_cells(root: Path):
     return cells, meta
 
 
-def label_instances(questions):
-    """Section 5's three buckets, per document.
-
-    every lookup recoverable + composed correct -> no failure
-    every lookup recoverable + composed wrong   -> silent failure
-    a lookup not recoverable                    -> storage failure
-
-    The sharp form of the hypothesis is that CoT gain sits in the silent bucket.
-    """
-    by_doc = defaultdict(lambda: {"probes": [], "main": None})
+def index_by_doc(questions):
+    """{doc_index: {"main": bool|None, "probes": {step: bool}}}"""
+    out = defaultdict(lambda: {"main": None, "probes": {}})
     for q in questions:
         d = q.get("doc_index")
         if d is None:
             continue
         if q.get("is_probe"):
-            by_doc[d]["probes"].append(q["ruler_score"] == 1.0)
+            out[d]["probes"][q.get("probe_step")] = q["ruler_score"] == 1.0
         else:
-            by_doc[d]["main"] = q["ruler_score"] == 1.0
+            out[d]["main"] = q["ruler_score"] == 1.0
+    return out
 
+
+def label_instances(questions, baseline=None):
+    """Section 5's three buckets, measured against the uncompressed row.
+
+    Absolute labelling does not work here. The model gets a single probe wrong about
+    30% of the time with NO compression at all, and there are five probes per
+    document, so 43 of 50 documents come back "storage failure" at 1x, where by
+    definition nothing can have been lost. The label would be measuring the model's
+    own error rate, not the cache.
+
+    So each cell is compared against the SAME budget and mode at 1x:
+      * only documents the model got right uncompressed are labelled at all;
+      * only probes that were correct uncompressed count as recoverable facts.
+
+      composed still correct                                  -> no failure
+      composed now wrong, every baseline-correct probe holds   -> silent failure
+      composed now wrong, a baseline-correct probe now fails    -> storage failure
+
+    The sharp form of the hypothesis is that CoT gain sits in the silent bucket.
+    """
+    cur = index_by_doc(questions)
     counts = {"no_failure": 0, "silent": 0, "storage": 0, "unlabelled": 0}
-    for d, v in by_doc.items():
+
+    for d, v in cur.items():
         if v["main"] is None or not v["probes"]:
             counts["unlabelled"] += 1
-        elif not all(v["probes"]):
-            counts["storage"] += 1
-        elif v["main"]:
+            continue
+
+        if baseline is None:                      # the 1x row itself
+            base_main, base_probes = True, {k: True for k in v["probes"]}
+        else:
+            b = baseline.get(d)
+            if b is None or not b["main"]:        # not solvable uncompressed: skip
+                counts["unlabelled"] += 1
+                continue
+            base_main = b["main"]
+            base_probes = {k: ok for k, ok in b["probes"].items() if ok}
+
+        if not base_probes:
+            counts["unlabelled"] += 1
+            continue
+
+        lost = any(not v["probes"].get(k, False) for k in base_probes)
+        if v["main"]:
             counts["no_failure"] += 1
+        elif lost:
+            counts["storage"] += 1
         else:
             counts["silent"] += 1
-    return counts, len(by_doc)
+    return counts, len(cur)
 
 
 def accuracy(questions, probes=False):
@@ -148,9 +181,20 @@ def main():
             print(f"{r:>7} " + "".join(fmt(a, 8) for a in row) + f"  {n:>4}")
 
     # ------------------------------------------------------- probes and labels
+    # Baselines come from the matching 1x cell: same budget, same mode.
+    baselines = {}
+    for b in BUDGETS:
+        for mode in ("none", "reason", "filler"):
+            key = ("1x", b, mode)
+            if key in cells:
+                baselines[(b, mode)] = index_by_doc(cells[key])
+
     print("\n=== per-hop probes, and the retained-but-latent split ===")
-    print(f"{'ratio':>7} {'budget':>7} {'mode':>7} {'probe':>7} "
-          f"{'ok':>5} {'silent':>7} {'storage':>8}")
+    print("    labels are matched against the same budget at 1x: only documents "
+          "solved uncompressed\n    are labelled, and only probes correct "
+          "uncompressed count as facts that were there.")
+    print(f"\n{'ratio':>7} {'budget':>7} {'mode':>7} {'probe':>7} "
+          f"{'ok':>5} {'silent':>7} {'storage':>8} {'n/a':>5}")
     for r in ratios:
         for b in BUDGETS:
             for mode in ("none", "reason", "filler"):
@@ -158,9 +202,11 @@ def main():
                 if key not in cells:
                     continue
                 pacc, _ = accuracy(cells[key], probes=True)
-                lab, ndoc = label_instances(cells[key])
+                base = None if r == "1x" else baselines.get((b, mode))
+                lab, ndoc = label_instances(cells[key], base)
                 print(f"{r:>7} {b:>7} {mode:>7} {fmt(pacc, 7)} "
-                      f"{lab['no_failure']:>5} {lab['silent']:>7} {lab['storage']:>8}")
+                      f"{lab['no_failure']:>5} {lab['silent']:>7} {lab['storage']:>8} "
+                      f"{lab['unlabelled']:>5}")
 
     # ------------------------------------------------------------- footprint
     print("\n=== footprint (millions of KV elements) ===")
