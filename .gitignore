@@ -43,3 +43,6 @@ hf_cache/
 .DS_Store
 .vscode/
 .idea/
+
+# generated chain datasets — rebuild with experiments/make_chain_data.py (deterministic)
+official/data/chain/*.jsonl

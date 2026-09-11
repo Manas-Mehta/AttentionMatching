@@ -48,6 +48,42 @@ def ruler_string_match_part(pred: str, refs: List[str]) -> float:
     return max(1.0 if r.lower() in pred.lower() else 0.0 for r in refs)
 
 
+_WORD_RE_CACHE: Dict[str, "re.Pattern"] = {}
+
+
+def chain_score_prediction(pred: str, refs: List[str], candidates: List[str]) -> float:
+    """Exact set match over the variable names the document actually contains.
+
+    Substring matching is not safe on this task. The answer is always one of the
+    chain's own variables, so a model that lists the whole chain scores 1.0 whatever
+    it believes. Observed in the 16x filler cell: gold `bridge`, prediction
+    `trophy, statue, bridge, thimble, pewter`, scored correct.
+
+    Scoring against the document's candidate names rather than raw tokens keeps a
+    verbose answer ("the answer is finger") correct while rejecting a hedged list.
+    The loader removes from `candidates` any name that appears in the question, so a
+    probe echoing its own premise is not counted as an extra guess.
+    """
+    import re as _re
+    found = set()
+    for c in candidates:
+        pat = _WORD_RE_CACHE.get(c)
+        if pat is None:
+            pat = _WORD_RE_CACHE[c] = _re.compile(r"\b" + _re.escape(c) + r"\b", _re.I)
+        if pat.search(pred):
+            found.add(c.lower())
+    return 1.0 if found == {r.lower() for r in refs} else 0.0
+
+
+def score_ruler_question(pred: str, q: Dict) -> float:
+    """Pick the metric: exact set match for the chain family, substring for RULER."""
+    refs = q.get('ruler_outputs', [])
+    candidates = q.get('score_candidates')
+    if candidates:
+        return chain_score_prediction(pred, refs, candidates)
+    return ruler_score_prediction(pred, refs, q.get('task', ''))
+
+
 def ruler_score_prediction(pred: str, refs: List[str], task: str) -> float:
     """Score a single RULER prediction using the appropriate metric for the task."""
     task_category = task.split('_')[0]
@@ -103,6 +139,122 @@ def qasper_score_prediction(prediction: str, gold_answers: List[str]) -> float:
         return 0.0
     prediction = strip_thinking(prediction)
     return max(compute_token_f1(prediction, gold) for gold in gold_answers)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: "Trading Memory for Compute" — CoT budget, forced-answer suffix, filler.
+#
+# Section 5 of the design doc: "CoT budget in {0, 64, 256, 1024} enforced by a decode
+# cap with a forced-answer suffix", plus the filler control, "match CoT length with
+# semantically empty padding".
+#
+# Configured by environment variable, matching the AM_N_SAMPLES / AM_GREEDY
+# convention already used here, so that official/ stays close to upstream:
+#   AM_COT_BUDGET  decode cap for the reasoning stage (0 = no reasoning stage)
+#   AM_COT_MODE    'reason' (the model decodes) | 'filler' (padding, no decoding)
+#   AM_COT_FILLER  the padding string repeated to fill the budget
+#
+# A question dict may override the budget; the loader pins probes to 0, because a
+# probe is meant to measure whether one lookup survives in a single forward pass.
+# ---------------------------------------------------------------------------
+_COT_INSTRUCTION = (
+    "\n\nThink step by step, working directly from the text. Do not restate the "
+    "question or the rules. Do not state the final answer until you are asked for it."
+)
+
+# Closing the reasoning turn and opening a fresh one is what actually forces an
+# answer. Appending a bare "Final answer:" to a truncated reasoning string does not:
+# the decode cap lands mid-sentence, the model carries straight on reasoning, and the
+# answer window fills with more reasoning that the substring scorer then reads.
+# Measured on the first smoke cell: 3 of 4 answers ran to the decode cap without ever
+# answering.
+# At budget 0 there is no forced-answer turn, so without this the model answers and
+# then writes an explanation, and the scorer substring-matches the explanation too.
+# Measured on the first 16x smoke cell: every answer was followed by "Explanation:".
+# Saying the same thing here that _FORCE_ANSWER_TURN says keeps the output format
+# identical across budgets, which is what makes the cells comparable.
+_NO_COT_INSTRUCTION = (
+    "\n\nOutput only the variable name or names, comma separated, with no "
+    "explanation and nothing else."
+)
+
+_FORCE_ANSWER_TURN = (
+    "Stop reasoning now and give your final answer. Output only the variable name or "
+    "names, comma separated, with no explanation and nothing else."
+)
+
+
+def _force_answer_prompt(tokenizer, question_content, reasoning, model_name, suffix):
+    """Reasoning as a closed assistant turn, then a user turn asking only for the answer."""
+    messages = [
+        {"role": "user", "content": question_content},
+        {"role": "assistant", "content": reasoning},
+        {"role": "user", "content": _FORCE_ANSWER_TURN},
+    ]
+    out = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+    if model_name and "gemma" in model_name.lower():
+        out = out[len("<bos>"):]
+    return out + suffix
+
+
+def _kv_elems_per_token(model) -> int:
+    """KV cache elements one token occupies across all layers (keys + values).
+
+    head_dim must be read off the config, not derived as hidden_size //
+    num_attention_heads. Qwen3 sets it explicitly and the two disagree: 128 against
+    2560/32 = 80, a factor of 1.6 in every footprint number.
+    """
+    cfg = model.config
+    kv_heads = getattr(cfg, 'num_key_value_heads', cfg.num_attention_heads)
+    head_dim = getattr(cfg, 'head_dim', None) or (cfg.hidden_size // cfg.num_attention_heads)
+    return 2 * cfg.num_hidden_layers * kv_heads * head_dim
+
+# Only the chain loader sets a forced-answer suffix. Everything else defaults to
+# empty, so existing RULER / keylen runs keep byte-identical prompts.
+_DEFAULT_FORCED_SUFFIX = "\nFinal answer:"
+
+
+def _cot_config(question: Optional[Dict] = None) -> Tuple[int, str, str]:
+    """(budget, mode, filler) for this question. Per-question budget wins."""
+    import os
+    budget = int(os.environ.get('AM_COT_BUDGET', '0'))
+    if question is not None and question.get('cot_budget') is not None:
+        budget = int(question['cot_budget'])
+    mode = os.environ.get('AM_COT_MODE', 'reason')
+    filler = os.environ.get('AM_COT_FILLER', ' ...')
+    return max(0, budget), mode, filler
+
+
+def _filler_text(tokenizer, budget: int, unit: str) -> str:
+    """Padding of exactly `budget` tokens.
+
+    Merrill & Sabharwal: padding tokens add no expressivity, serial decoding does.
+    So if filler matches real CoT, the effect was cache capacity and not reasoning.
+    The length has to match the CoT length in TOKENS for that comparison to mean
+    anything, hence the trim rather than a repeat count.
+    """
+    if budget <= 0 or not unit:
+        return ""
+    per = max(1, len(tokenizer.encode(unit, add_special_tokens=False)))
+    text = unit * (budget // per + 2)
+    ids = tokenizer.encode(text, add_special_tokens=False)[:budget]
+    return tokenizer.decode(ids, skip_special_tokens=True)
+
+
+def _partition_homogeneous(questions: List[Dict]) -> List[List[Dict]]:
+    """Split into runs that share a decode cap and a reasoning budget.
+
+    The batching below reads `max_new_tokens` off batch_questions[0] and applies it
+    to the whole batch. That was safe while every article had one question; with the
+    Phase 1 probes attached it is not, since a probe has a different cap and a pinned
+    budget of 0. Grouping first keeps each batch homogeneous.
+    """
+    groups: Dict[Tuple, List[Dict]] = {}
+    for q in questions:
+        key = (q.get('max_new_tokens'), q.get('cot_budget'))
+        groups.setdefault(key, []).append(q)
+    return list(groups.values())
 
 
 class QAEvaluator:
@@ -180,6 +332,28 @@ class QAEvaluator:
             If True, use QASPER-style formatting (no MCQ, free-form generation)
             and token F1 scoring instead of MCQ parsing
         """
+        # Phase 1 attaches per-hop probes to the same article as the composed
+        # question, with their own decode cap and a pinned reasoning budget of 0.
+        # The loop below applies batch_questions[0]'s cap to the whole batch, so the
+        # questions have to be grouped before batching or a probe would inherit the
+        # composed question's budget.
+        _groups = _partition_homogeneous(questions)
+        if len(_groups) > 1:
+            for _g in _groups:
+                self._evaluate_questions_batched(
+                    _g, cache_for_generation, seq_len, max_new_tokens, batch_size,
+                    results_per_question, is_ruler_eval=is_ruler_eval,
+                    is_qasper_eval=is_qasper_eval,
+                )
+            return
+
+        # Prefix footprint, for section 5's "record prefix cache size and peak total
+        # footprint (prefix + decoded suffix) at every point". Counted in tensor
+        # elements: C_k, beta and C_v are what the compacted prefix actually costs.
+        _prefix_elems = sum(int(c1.numel() + b.numel() + c2.numel())
+                            for c1, b, c2 in cache_for_generation)
+        _per_token_elems = _kv_elems_per_token(self.model)
+
         num_questions = len(questions)
 
         # Process questions in batches
@@ -220,14 +394,22 @@ class QAEvaluator:
 
             # Format prompts — RULER uses thinking OFF and answer_prefix;
             # QASPER uses free-form generation (no options, thinking ON)
+            _cot_budget, _cot_mode, _cot_filler = 0, 'reason', ''
             if is_ruler_eval:
+                _cot_budget, _cot_mode, _cot_filler = _cot_config(batch_questions[0])
+                # Ask for reasoning only when there is a budget to spend on it.
+                _q_contents = [
+                    q['question'] + (_COT_INSTRUCTION if _cot_budget > 0
+                                     else _NO_COT_INSTRUCTION)
+                    for q in batch_questions
+                ]
                 formatted_questions = [
                     format_question(
-                        self.tokenizer, q['question'], options=None,
+                        self.tokenizer, qc, options=None,
                         model_name=self.model_name, enable_thinking=False,
                         answer_prefix=q.get('answer_prefix', ''),
                     )
-                    for q in batch_questions
+                    for qc, q in zip(_q_contents, batch_questions)
                 ]
                 # Use per-task max_new_tokens for RULER (override the global default)
                 batch_max_new_tokens = batch_questions[0].get('max_new_tokens', max_new_tokens)
@@ -251,10 +433,49 @@ class QAEvaluator:
                 for c1, beta, c2 in cache_for_generation
             ])
 
+            # ---- reasoning stage, then forced answer (section 5) -----------------
+            # Stage 1 decodes at most _cot_budget tokens, or writes _cot_budget tokens
+            # of padding in filler mode. Stage 2 appends the forced-answer suffix and
+            # decodes the answer. ONLY stage 2's output is scored: the scorer is a
+            # substring match over the whole string, so scoring the reasoning too
+            # would mark an instance correct the moment the gold string appeared
+            # anywhere in the thinking, which would manufacture the result.
+            _suffixes = [q.get('forced_answer_suffix', '')
+                         for q in batch_questions]
+            if _cot_budget <= 0:
+                _reasonings = [''] * actual_batch_size
+            elif _cot_mode == 'filler':
+                _reasonings = [_filler_text(self.tokenizer, _cot_budget, _cot_filler)] \
+                    * actual_batch_size
+            else:
+                _reasonings = generate_with_compacted_cache_batch(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    prompts=formatted_questions,
+                    compacted_cache=compacted_cache_gpu,
+                    max_new_tokens=_cot_budget,
+                    original_seq_len=seq_len,
+                )
+            _reasoning_tokens = [
+                len(self.tokenizer.encode(r, add_special_tokens=False)) if r else 0
+                for r in _reasonings
+            ]
+            if _cot_budget <= 0:
+                final_prompts = [fq + sfx for fq, sfx
+                                 in zip(formatted_questions, _suffixes)]
+            else:
+                final_prompts = [
+                    _force_answer_prompt(self.tokenizer, qc, r, self.model_name, sfx)
+                    for qc, r, sfx in zip(_q_contents, _reasonings, _suffixes)
+                ]
+            if _cot_budget > 0:
+                print(f"  [cot] mode={_cot_mode} budget={_cot_budget} "
+                      f"used={_reasoning_tokens}")
+
             answers = generate_with_compacted_cache_batch(
                 model=self.model,
                 tokenizer=self.tokenizer,
-                prompts=formatted_questions,
+                prompts=final_prompts,
                 compacted_cache=compacted_cache_gpu,
                 max_new_tokens=batch_max_new_tokens,
                 original_seq_len=seq_len,
@@ -266,14 +487,14 @@ class QAEvaluator:
             import os as _os
             _nsamp = int(_os.environ.get('AM_N_SAMPLES', '1'))
             _greedy_on = _os.environ.get('AM_GREEDY', '0') == '1'
-            _nq = len(formatted_questions)
+            _nq = len(final_prompts)
             _greedy_answers = [None] * _nq
             _sample_answers = [[a] for a in answers]
 
             if _greedy_on:
                 _greedy_answers = generate_with_compacted_cache_batch(
                     model=self.model, tokenizer=self.tokenizer,
-                    prompts=formatted_questions,
+                    prompts=final_prompts,
                     compacted_cache=compacted_cache_gpu,
                     max_new_tokens=batch_max_new_tokens,
                     original_seq_len=seq_len, greedy=True,
@@ -281,7 +502,7 @@ class QAEvaluator:
             if _nsamp > 1:
                 _extra = generate_with_compacted_cache_batch(
                     model=self.model, tokenizer=self.tokenizer,
-                    prompts=formatted_questions * (_nsamp - 1),
+                    prompts=final_prompts * (_nsamp - 1),
                     compacted_cache=compacted_cache_gpu,
                     max_new_tokens=batch_max_new_tokens,
                     original_seq_len=seq_len,
@@ -316,20 +537,24 @@ class QAEvaluator:
                 print(f"A{q_idx+1}: {answer[:100]}...")
 
                 num_gen_tokens = batch_token_counts[i]
+                _prompt_tokens_i = len(self.tokenizer.encode(
+                    final_prompts[i], add_special_tokens=False))
 
                 if is_ruler_eval:
                     # RULER string-match scoring
                     refs = q.get('ruler_outputs', [])
                     task = q.get('task', '')
-                    score = ruler_score_prediction(answer, refs, task)
+                    score = score_ruler_question(answer, q)
                     is_correct = score == 1.0
+                    # kept for comparison: what the old substring metric would say
+                    _substr_score = ruler_score_prediction(answer, refs, task)
                     print(f"  RULER score: {score:.2f} | Task: {task} | Refs: {refs}")
 
                     # [MULTISAMPLE] per-sample labels + the hit rate
                     _samp = _sample_answers[i]
-                    _samp_ok = [ruler_score_prediction(a, refs, task) == 1.0 for a in _samp]
+                    _samp_ok = [score_ruler_question(a, q) == 1.0 for a in _samp]
                     _g_ans = _greedy_answers[i]
-                    _g_ok = (ruler_score_prediction(_g_ans, refs, task) == 1.0
+                    _g_ok = (score_ruler_question(_g_ans, q) == 1.0
                              ) if _g_ans is not None else None
                     if len(_samp) > 1 or _g_ans is not None:
                         print(f"  [multisample] hit_rate={sum(_samp_ok)}/{len(_samp)}"
@@ -348,10 +573,29 @@ class QAEvaluator:
                         'greedy_answer': _g_ans,
                         'greedy_is_correct': _g_ok,
                         'ruler_score': score,
+                        'ruler_score_substring': _substr_score,
                         'is_correct': is_correct,
                         'generation_time': gen_time / actual_batch_size,
                         'num_generated_tokens': num_gen_tokens,
                         'time_per_token': batch_time_per_token,
+                        # ---- Phase 1 -------------------------------------------
+                        'cot_budget': _cot_budget,
+                        'cot_mode': _cot_mode if _cot_budget > 0 else 'none',
+                        'reasoning_text': _reasonings[i],
+                        'reasoning_tokens': _reasoning_tokens[i],
+                        # footprint: prefix cache, and prefix + everything decoded
+                        # after it (prompt, reasoning, suffix, answer)
+                        'prefix_cache_elems': _prefix_elems,
+                        'suffix_tokens': _prompt_tokens_i + num_gen_tokens,
+                        'peak_total_elems': _prefix_elems
+                                            + (_prompt_tokens_i + num_gen_tokens)
+                                            * _per_token_elems,
+                        # per-instance labels, copied through by the chain loader
+                        **{k: q[k] for k in (
+                            'is_probe', 'probe_kind', 'probe_chain', 'probe_step',
+                            'depth', 'breadth', 'hops', 'name_style', 'haystack',
+                            'question_form', 'ctx_tokens', 'doc_index',
+                        ) if k in q},
                     }
                 elif is_qasper_eval:
                     # QASPER token F1 scoring
@@ -987,17 +1231,32 @@ class QAEvaluator:
                     # Use batch_size=1 for sequential generation
                     effective_batch_size = batch_size if batch_size is not None and batch_size > 0 else 1
 
-                    for batch_start in range(0, len(questions), effective_batch_size):
-                        batch_end = min(batch_start + effective_batch_size, len(questions))
-                        batch_questions = questions[batch_start:batch_end]
+                    # Batches must not mix decode caps or reasoning budgets: the
+                    # cap is read off batch_questions[0] below, and Phase 1 probes
+                    # carry their own. Group first, then batch inside each group.
+                    _vllm_batches = [g[k:k + effective_batch_size]
+                                     for g in _partition_homogeneous(questions)
+                                     for k in range(0, len(g), effective_batch_size)]
+                    _seen = 0
+                    for batch_questions in _vllm_batches:
+                        batch_start, _seen = _seen, _seen + len(batch_questions)
 
                         # Format prompts
+                        _cot_budget, _cot_mode, _cot_filler = (
+                            _cot_config(batch_questions[0]) if is_ruler_eval
+                            else (0, 'reason', ''))
                         prompts = []
+                        _q_contents = []
                         for q in batch_questions:
                             question_text = q['question']
                             if is_ruler_eval:
+                                question_text = question_text + (
+                                    _COT_INSTRUCTION if _cot_budget > 0
+                                    else _NO_COT_INSTRUCTION)
                                 question_formatted = format_question(
-                                    self.tokenizer, question_text, options=None,
+                                    self.tokenizer,
+                                    question_text,
+                                    options=None,
                                     model_name=self.model_name, enable_thinking=False,
                                     answer_prefix=q.get('answer_prefix', ''),
                                 )
@@ -1013,11 +1272,56 @@ class QAEvaluator:
                                 question_formatted = format_question(self.tokenizer, question_text, options, self.model_name)
                             full_prompt = context_for_generation + question_formatted
                             prompts.append(full_prompt)
+                            _q_contents.append(question_text)
 
                         # Generate batch — use per-task max_new_tokens for RULER
                         batch_max_new_tokens = batch_questions[0].get('max_new_tokens', max_new_tokens) if is_ruler_eval else max_new_tokens
                         gen_start = time.time()
                         gen_params = get_generation_params(self.model)
+
+                        # Footprint. Nothing is compacted on this path, so the prefix
+                        # is the full context and costs one token's worth of KV per
+                        # token of document.
+                        _per_token_elems = _kv_elems_per_token(self.model)
+                        _prefix_elems = _per_token_elems * len(self.tokenizer.encode(
+                            context_for_generation, add_special_tokens=False))
+
+                        # Reasoning stage then forced answer, exactly as on the
+                        # compacted-cache path. The 1x row of the Phase 1 grid is
+                        # produced here, so it has to use the same prompt format and
+                        # the same tail-only scoring or it is not on the same surface.
+                        _suffixes = [q.get('forced_answer_suffix', '')
+                                     for q in batch_questions]
+                        if _cot_budget <= 0:
+                            _reasonings = [''] * len(prompts)
+                        elif _cot_mode == 'filler':
+                            _reasonings = [_filler_text(self.tokenizer, _cot_budget, _cot_filler)] \
+                                * len(prompts)
+                        else:
+                            _reasonings = generate_with_vllm_batch(
+                                vllm_model=self.vllm_model,
+                                full_prompts=prompts,
+                                max_new_tokens=_cot_budget,
+                                temperature=gen_params['temperature'],
+                                top_k=gen_params['top_k'],
+                                top_p=gen_params['top_p'],
+                            )
+                        _reasoning_tokens = [
+                            len(self.tokenizer.encode(r, add_special_tokens=False)) if r else 0
+                            for r in _reasonings
+                        ]
+                        if _cot_budget <= 0:
+                            prompts = [pp + sfx for pp, sfx in zip(prompts, _suffixes)]
+                        else:
+                            prompts = [
+                                context_for_generation + _force_answer_prompt(
+                                    self.tokenizer, qc, r, self.model_name, sfx)
+                                for qc, r, sfx in zip(_q_contents, _reasonings, _suffixes)
+                            ]
+                        if _cot_budget > 0:
+                            print(f"  [cot] mode={_cot_mode} budget={_cot_budget} "
+                                  f"used={_reasoning_tokens}")
+
                         answers = generate_with_vllm_batch(
                             vllm_model=self.vllm_model,
                             full_prompts=prompts,
@@ -1032,14 +1336,19 @@ class QAEvaluator:
                         for i, (q, answer) in enumerate(zip(batch_questions, answers)):
                             gen_tokens = self.tokenizer.encode(answer, add_special_tokens=False)
                             num_gen_tokens = len(gen_tokens)
+                            # prompt minus the shared document prefix, already counted
+                            _prompt_tokens_i = len(self.tokenizer.encode(
+                                prompts[i], add_special_tokens=False)) - (
+                                _prefix_elems // _per_token_elems)
                             per_question_time = gen_time / len(batch_questions)
                             time_per_token = per_question_time / num_gen_tokens if num_gen_tokens > 0 else 0.0
 
                             if is_ruler_eval:
                                 refs = q.get('ruler_outputs', [])
                                 task = q.get('task', '')
-                                score = ruler_score_prediction(answer, refs, task)
+                                score = score_ruler_question(answer, q)
                                 is_correct = score == 1.0
+                                _substr_score = ruler_score_prediction(answer, refs, task)
                                 print(f"Q{batch_start + i + 1}: {q['question'][:80]}...")
                                 print(f"  A: {answer[:100]}... | Score: {score:.2f} | Task: {task}")
                                 results_per_question.append({
@@ -1049,10 +1358,27 @@ class QAEvaluator:
                                     'ruler_outputs': refs,
                                     'model_answer_text': answer,
                                     'ruler_score': score,
+                                    'ruler_score_substring': _substr_score,
                                     'is_correct': is_correct,
                                     'generation_time': per_question_time,
                                     'num_generated_tokens': num_gen_tokens,
                                     'time_per_token': time_per_token,
+                                    # ---- Phase 1 ---------------------------------
+                                    'cot_budget': _cot_budget,
+                                    'cot_mode': _cot_mode if _cot_budget > 0 else 'none',
+                                    'reasoning_text': _reasonings[i],
+                                    'reasoning_tokens': _reasoning_tokens[i],
+                                    'prefix_cache_elems': _prefix_elems,
+                                    'suffix_tokens': _prompt_tokens_i + num_gen_tokens,
+                                    'peak_total_elems': _prefix_elems
+                                                        + (_prompt_tokens_i + num_gen_tokens)
+                                                        * _per_token_elems,
+                                    **{k: q[k] for k in (
+                                        'is_probe', 'probe_kind', 'probe_chain',
+                                        'probe_step', 'depth', 'breadth', 'hops',
+                                        'name_style', 'haystack', 'question_form',
+                                        'ctx_tokens', 'doc_index',
+                                    ) if k in q},
                                 })
                             elif is_qasper_eval:
                                 refs = q.get('qasper_answers', [])

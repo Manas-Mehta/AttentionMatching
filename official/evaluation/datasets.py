@@ -787,6 +787,101 @@ def load_keylen_data(task: str) -> List[Dict]:
     return data
 
 
+def load_chain_data(task: str) -> List[Dict]:
+    """
+    Load the entity-attribute chain dataset for Phase 1 ("Trading Memory for Compute").
+
+    Reads ``data/chain/{task}.jsonl``, produced by ``experiments/make_chain_data.py``.
+    Each row is one document with an independently set depth, breadth, needle entropy
+    and haystack entropy, so the Phase 1 surface can be fit over all four.
+
+    One document becomes one article carrying SEVERAL questions:
+
+      * the composed question (``is_probe`` False) — the thing the surface measures;
+      * one probe per constituent lookup (``is_probe`` True) — section 5's
+        retained-but-latent labelling. Probes run against the SAME compacted cache,
+        so they cost a few decoded tokens each and no extra compaction.
+
+    Probes are pinned to a zero reasoning budget: a probe is meant to be one forward
+    pass, otherwise it stops measuring whether the fact is reachable without CoT.
+    """
+    fp = Path('data/chain') / f'{task}.jsonl'
+    if not fp.exists():
+        raise ValueError(
+            f"Chain dataset not found: {fp}. Generate it first with e.g. "
+            f"`python experiments/make_chain_data.py --hops 4 --chains 1 "
+            f"--names word --haystack prose --ctx 4096 --n 50`."
+        )
+    rows = []
+    with open(fp) as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    if not rows:
+        raise ValueError(f"No rows in {fp}")
+
+    data = []
+    for idx, row in enumerate(rows):
+        # metadata copied onto every question so the analysis never has to rejoin
+        meta = {k: row[k] for k in (
+            'depth', 'breadth', 'hops', 'name_style', 'haystack', 'question_form',
+            'ctx_target', 'ctx_tokens', 'value', 'chain_names', 'doc_index',
+        ) if k in row}
+
+        # Candidate names for exact set-match scoring. Any name the question itself
+        # mentions is removed, so a probe that echoes its own premise ("VAR vinegar
+        # is assigned the value of VAR stallion") is not read as two guesses.
+        all_names = [n for ns in row.get('chain_names', []) for n in ns]
+
+        def candidates_for(text):
+            return [n for n in all_names
+                    if not re.search(r'\b' + re.escape(n) + r'\b', text, re.I)]
+
+        questions = [{
+            'question': row['question'],
+            'score_candidates': candidates_for(row['question']),
+            'ruler_outputs': row['answer'],
+            'answer_prefix': row.get('answer_prefix', ''),
+            'forced_answer_suffix': row.get('forced_answer_suffix', '\nFinal answer:'),
+            'max_new_tokens': row.get('max_new_tokens', 64),
+            'task': task,
+            'question_unique_id': f"{task}_{idx}_main",
+            'is_probe': False,
+            **meta,
+        }]
+        for pi, probe in enumerate(row.get('probes', [])):
+            questions.append({
+                'question': probe['question'],
+                'score_candidates': candidates_for(probe['question']),
+                'ruler_outputs': probe['answer'],
+                'answer_prefix': row.get('answer_prefix', ''),
+                'forced_answer_suffix': row.get('forced_answer_suffix', '\nFinal answer:'),
+                'max_new_tokens': 24 + 12 * len(probe['answer']),
+                'task': task,
+                'question_unique_id': f"{task}_{idx}_probe{pi}",
+                'is_probe': True,
+                'probe_kind': probe['kind'],
+                'probe_chain': probe['chain'],
+                'probe_step': probe['step'],
+                'cot_budget': 0,          # a probe is one forward pass, by definition
+                **meta,
+            })
+
+        data.append({
+            'article_id': f"{task}_{idx}",
+            'title': f"chain {task} (document {idx})",
+            'article': row['context'],
+            'questions': questions,
+        })
+
+    n_probes = sum(1 for q in data[0]['questions'] if q['is_probe'])
+    print(f"Loaded {len(data)} chain articles for {task} "
+          f"(1 composed question + {n_probes} probes each, "
+          f"depth={data[0]['questions'][0].get('depth')}, "
+          f"breadth={data[0]['questions'][0].get('breadth')})")
+    return data
+
+
 def load_qasper_data() -> List[Dict]:
     """
     Load QASPER dataset from HuggingFace.
@@ -1024,6 +1119,10 @@ def load_dataset(dataset_name: str, include_diagnosis: bool = True) -> List[Dict
         # key-length sweep: 'keylen_16' / 'keylen_32' / 'keylen_64' / 'keylen_96' (bits)
         return load_keylen_data(dataset_name)
 
+    elif dataset_name.startswith('chain'):
+        # Phase 1 entity-attribute chains, e.g. 'chain_d4_b1_word_prose_4k_last'
+        return load_chain_data(dataset_name)
+
     elif dataset_name.startswith('ruler'):
         # Parse context length and optional task filter from dataset name
         # Formats: 'ruler_4k', 'ruler_128k', 'ruler_4k_niah_single_1'
@@ -1124,9 +1223,11 @@ def is_perplexity_dataset(dataset_name: str) -> bool:
 
 
 # Datasets that use string-match evaluation + gold perplexity (RULER benchmark,
-# plus the 'keylen' sweep — real RULER niah_single_3 docs with the key swapped, so
-# it must go down the same RULER scoring / gold-perplexity path, not the MCQ path).
-RULER_DATASET_PREFIXES = ('ruler', 'keylen')
+# plus the 'keylen' sweep — real RULER niah_single_3 docs with the key swapped — and
+# the Phase 1 'chain' family, which is RULER variable_tracking with depth, breadth and
+# the two entropies opened up. All must go down the RULER scoring / gold-perplexity
+# path, not the MCQ path).
+RULER_DATASET_PREFIXES = ('ruler', 'keylen', 'chain')
 RULER_DATASET_PREFIX = RULER_DATASET_PREFIXES[0]  # back-compat for any external refs
 
 
