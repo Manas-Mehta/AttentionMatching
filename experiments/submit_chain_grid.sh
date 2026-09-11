@@ -29,8 +29,13 @@ N="${N:-50}"
 OUTROOT="${OUTROOT:-chain_phase1}"
 DRYRUN="${DRYRUN:-0}"
 
+# Torch has no submit-time rerouting, so a partition list works: Slurm starts the
+# job wherever a GPU frees first. Qwen3-4B at 4k fits in all three with room over,
+# and queue time dominates the ~2x run-time spread between H200 and L40S.
+PARTS="${PARTS:-h200_courant,h100,l40s_courant}"
+
 case "$SITE" in
-  torch)  SCRIPT=slurm/chain_torch.sh;  EXTRA="" ;;
+  torch)  SCRIPT=slurm/chain_torch.sh;  EXTRA="--partition=${PARTS}" ;;
   empire) SCRIPT=slurm/chain_empire.sh; EXTRA="" ;;
   *) echo "usage: $0 [torch|empire]" >&2; exit 2 ;;
 esac
@@ -51,7 +56,7 @@ n=0
 for cell in "1x 1.0 original ${BIG}" "4x 0.25 am" "8x 0.125 am" \
             "16x 0.0625 am" "32x 0.03125 am" "64x 0.015625 am"; do
   set -- $cell
-  tag=$1; ts=$2; method=$3; shift 3; extra="$*"
+  tag=$1; ts=$2; method=$3; shift 3; extra="$EXTRA $*"
   for budget in 0 64 256 1024; do
     submit "$tag" "$ts" "$method" "$budget" reason "$extra"; n=$((n+1))
     if [ "$budget" -ne 0 ]; then
