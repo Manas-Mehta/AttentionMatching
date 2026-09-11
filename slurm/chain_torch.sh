@@ -42,6 +42,19 @@ export HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export CACHE_STORE="${CACHE_STORE:-}"
 
+# Everything scratch-side. The login and compute nodes share a small /tmp ramdisk
+# that other users fill, and torch/vllm/triton all spill compile caches there by
+# default, which is a silent way to lose a long job to ENOSPC.
+export TMPDIR="${SCRATCH}/tmp"
+export TRITON_CACHE_DIR="${SCRATCH}/tmp/triton"
+export VLLM_CACHE_ROOT="${SCRATCH}/tmp/vllm"
+export TORCHINDUCTOR_CACHE_DIR="${SCRATCH}/tmp/inductor"
+export XDG_CACHE_HOME="${SCRATCH}/.cache"
+export MPLCONFIGDIR="${SCRATCH}/tmp/mpl"
+mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR" "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" \
+         "$XDG_CACHE_HOME" "$MPLCONFIGDIR"
+
+
 cd "${PROJECT_DIR}"
 mkdir -p slurm_logs results
 
