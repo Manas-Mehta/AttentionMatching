@@ -61,7 +61,7 @@ mkdir -p slurm_logs results
 echo "=== chain  job=${SLURM_JOB_ID:-local}  node=$(hostname)  part=${SLURM_JOB_PARTITION:-?} ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "no GPU?"
 echo "  TASK=${TASK:-default}  TARGET_SIZE=${TARGET_SIZE:-0.0625}  METHOD=${METHOD:-am}"
-echo "  COT_BUDGET=${COT_BUDGET:-0}  COT_MODE=${COT_MODE:-reason}  N=${N:-50}"
+echo "  COT_BUDGET=${COT_BUDGET:-0}  COT_MODE=${COT_MODE:-reason}  COT_PROMPT=${COT_PROMPT:-none}  N=${N:-50}"
 echo ""
 
 start=$(date +%s)

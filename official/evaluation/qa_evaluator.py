@@ -11,7 +11,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from compaction.compaction_methods import FullCacheCompactionAlgorithm
 from compaction.algorithms.base import evaluate_compaction
@@ -183,6 +183,40 @@ _FORCE_ANSWER_TURN = (
     "names, comma separated, with no explanation and nothing else."
 )
 
+# --- Method A: prompt modes (no hard cap) ----------------------------------
+# "Trading Memory for Compute", budget-forcing revision. Rather than truncate the
+# reasoning at a fixed token count, run the model in different "modes" and let it
+# stop on its own. The budget for a mode is then the AVERAGE number of tokens it
+# actually generated, read off afterward -- never a limit imposed up front.
+#
+# Inspired by TALE (Token-Budget-Aware LLM Reasoning, arXiv:2412.18547): a plain
+# natural-language length instruction in the prompt, soft, no decode cap. We keep
+# the mechanism and drop TALE's goal (it minimises length; we spread it) and its
+# per-question budget estimation (we fix a few modes and measure each).
+#
+#   AM_COT_PROMPT   '' (legacy fixed-cap) | immediate | brief | moderate | long
+#   AM_COT_CEILING  safety cap for the reasoning stage under a prompt mode; a guard
+#                   against runaways, NOT a budget (default 2048)
+#   AM_COT_FILLER_TARGET  token count for the filler twin of a prompt mode, i.e. the
+#                   measured mean length of the paired reason run (0 = skip filler)
+_PROMPT_MODE_INSTRUCTION = {
+    # immediate has no reasoning turn at all; it reuses the no-CoT instruction.
+    "immediate": _NO_COT_INSTRUCTION,
+    "brief": (
+        "\n\nThink in one short sentence, working directly from the text, then stop. "
+        "Do not restate the question or the rules, and do not give the final answer yet."
+    ),
+    "moderate": (
+        "\n\nReason in a few short paragraphs, working directly from the text. Do not "
+        "restate the question or the rules, and do not give the final answer yet."
+    ),
+    "long": (
+        "\n\nThink step by step for as long as you need, working directly from the "
+        "text. Do not restate the question or the rules, and do not give the final "
+        "answer yet."
+    ),
+}
+
 
 def _force_answer_prompt(tokenizer, question_content, reasoning, model_name, suffix):
     """Reasoning as a closed assistant turn, then a user turn asking only for the answer."""
@@ -224,6 +258,77 @@ def _cot_config(question: Optional[Dict] = None) -> Tuple[int, str, str]:
     mode = os.environ.get('AM_COT_MODE', 'reason')
     filler = os.environ.get('AM_COT_FILLER', ' ...')
     return max(0, budget), mode, filler
+
+
+class _CotPlan(NamedTuple):
+    """Resolved CoT plan for one batch, shared by both generation paths.
+
+    has_turn         a reasoning assistant turn exists (real CoT or filler)
+    generate         actually decode the reasoning (real CoT, not filler)
+    stage1_cap       max_new_tokens for the reasoning decode (ceiling in prompt-mode,
+                     the fixed budget in legacy)
+    instruction      appended to the question (mode-specific, or the no-CoT line)
+    fill_tokens      token count for filler mode
+    mode             'reason' | 'filler'
+    prompt_mode      '' (legacy) | immediate | brief | moderate | long
+    budget           legacy fixed budget (0 under a prompt mode)
+    label            cell tag for logging: 'cot256_reason' or 'modelong_reason'
+    """
+    has_turn: bool
+    generate: bool
+    stage1_cap: int
+    instruction: str
+    fill_tokens: int
+    filler_unit: str
+    mode: str
+    prompt_mode: str
+    budget: int
+    label: str
+
+
+def _cot_plan(question: Optional[Dict] = None) -> _CotPlan:
+    """Resolve how the reasoning stage runs for this batch.
+
+    Two regimes. Legacy: a fixed decode cap (AM_COT_BUDGET) defines the budget.
+    Prompt-mode (AM_COT_PROMPT set): no cap, the model stops on its own and the
+    budget is measured afterward. The two never mix -- a prompt mode overrides the
+    fixed cap entirely.
+    """
+    import os
+    budget, mode, filler_unit = _cot_config(question)
+    prompt_mode = os.environ.get('AM_COT_PROMPT', '').strip().lower()
+
+    if prompt_mode:                                    # method A
+        ceiling = int(os.environ.get('AM_COT_CEILING', '2048'))
+        fill_target = int(os.environ.get('AM_COT_FILLER_TARGET', '0'))
+        has_turn = prompt_mode != 'immediate'
+        instruction = _PROMPT_MODE_INSTRUCTION.get(prompt_mode, _COT_INSTRUCTION)
+        return _CotPlan(
+            has_turn=has_turn,
+            generate=has_turn and mode == 'reason',
+            stage1_cap=ceiling,
+            instruction=instruction if has_turn else _NO_COT_INSTRUCTION,
+            fill_tokens=fill_target,
+            filler_unit=filler_unit,
+            mode=mode,
+            prompt_mode=prompt_mode,
+            budget=0,
+            label=f"mode{prompt_mode}" + ('' if not has_turn else f"_{mode}"),
+        )
+
+    has_turn = budget > 0                              # legacy fixed cap
+    return _CotPlan(
+        has_turn=has_turn,
+        generate=has_turn and mode == 'reason',
+        stage1_cap=budget,
+        instruction=_COT_INSTRUCTION if has_turn else _NO_COT_INSTRUCTION,
+        fill_tokens=budget,
+        filler_unit=filler_unit,
+        mode=mode,
+        prompt_mode='',
+        budget=budget,
+        label=('cot0' if not has_turn else f"cot{budget}_{mode}"),
+    )
 
 
 def _filler_text(tokenizer, budget: int, unit: str) -> str:
@@ -394,13 +499,12 @@ class QAEvaluator:
 
             # Format prompts — RULER uses thinking OFF and answer_prefix;
             # QASPER uses free-form generation (no options, thinking ON)
-            _cot_budget, _cot_mode, _cot_filler = 0, 'reason', ''
+            _plan = None
             if is_ruler_eval:
-                _cot_budget, _cot_mode, _cot_filler = _cot_config(batch_questions[0])
-                # Ask for reasoning only when there is a budget to spend on it.
+                _plan = _cot_plan(batch_questions[0])
+                # Ask for reasoning only when there is a turn to spend on it.
                 _q_contents = [
-                    q['question'] + (_COT_INSTRUCTION if _cot_budget > 0
-                                     else _NO_COT_INSTRUCTION)
+                    q['question'] + _plan.instruction
                     for q in batch_questions
                 ]
                 formatted_questions = [
@@ -425,6 +529,13 @@ class QAEvaluator:
                                      for q_text, opts in zip(question_texts, options_list)]
                 batch_max_new_tokens = max_new_tokens
 
+            # Non-RULER paths have no reasoning stage; give them a no-turn plan so the
+            # shared stage-1 block below reads uniformly.
+            if _plan is None:
+                _plan = _CotPlan(has_turn=False, generate=False, stage1_cap=0,
+                                 instruction='', fill_tokens=0, filler_unit='',
+                                 mode='reason', prompt_mode='', budget=0, label='cot0')
+
             # Batch generate with compacted cache
             gen_start_time = time.time()
             device = next(self.model.parameters()).device
@@ -434,33 +545,36 @@ class QAEvaluator:
             ])
 
             # ---- reasoning stage, then forced answer (section 5) -----------------
-            # Stage 1 decodes at most _cot_budget tokens, or writes _cot_budget tokens
-            # of padding in filler mode. Stage 2 appends the forced-answer suffix and
+            # Stage 1 decodes the reasoning (capped only by the safety ceiling under a
+            # prompt mode, or by the fixed budget in legacy), or writes matched padding
+            # in filler mode. Stage 2 appends the forced-answer suffix and
             # decodes the answer. ONLY stage 2's output is scored: the scorer is a
             # substring match over the whole string, so scoring the reasoning too
             # would mark an instance correct the moment the gold string appeared
             # anywhere in the thinking, which would manufacture the result.
             _suffixes = [q.get('forced_answer_suffix', '')
                          for q in batch_questions]
-            if _cot_budget <= 0:
+            if not _plan.has_turn:
                 _reasonings = [''] * actual_batch_size
-            elif _cot_mode == 'filler':
-                _reasonings = [_filler_text(self.tokenizer, _cot_budget, _cot_filler)] \
-                    * actual_batch_size
+            elif _plan.mode == 'filler':
+                _reasonings = [_filler_text(self.tokenizer, _plan.fill_tokens,
+                                            _plan.filler_unit)] * actual_batch_size
             else:
+                # No hard cap under a prompt mode: stage1_cap is a safety ceiling, the
+                # model stops on its own, and the budget is the measured length below.
                 _reasonings = generate_with_compacted_cache_batch(
                     model=self.model,
                     tokenizer=self.tokenizer,
                     prompts=formatted_questions,
                     compacted_cache=compacted_cache_gpu,
-                    max_new_tokens=_cot_budget,
+                    max_new_tokens=_plan.stage1_cap,
                     original_seq_len=seq_len,
                 )
             _reasoning_tokens = [
                 len(self.tokenizer.encode(r, add_special_tokens=False)) if r else 0
                 for r in _reasonings
             ]
-            if _cot_budget <= 0:
+            if not _plan.has_turn:
                 final_prompts = [fq + sfx for fq, sfx
                                  in zip(formatted_questions, _suffixes)]
             else:
@@ -468,8 +582,9 @@ class QAEvaluator:
                     _force_answer_prompt(self.tokenizer, qc, r, self.model_name, sfx)
                     for qc, r, sfx in zip(_q_contents, _reasonings, _suffixes)
                 ]
-            if _cot_budget > 0:
-                print(f"  [cot] mode={_cot_mode} budget={_cot_budget} "
+            if _plan.has_turn:
+                print(f"  [cot] label={_plan.label} mode={_plan.mode} "
+                      f"prompt_mode={_plan.prompt_mode or '-'} cap={_plan.stage1_cap} "
                       f"used={_reasoning_tokens}")
 
             answers = generate_with_compacted_cache_batch(
@@ -579,8 +694,10 @@ class QAEvaluator:
                         'num_generated_tokens': num_gen_tokens,
                         'time_per_token': batch_time_per_token,
                         # ---- Phase 1 -------------------------------------------
-                        'cot_budget': _cot_budget,
-                        'cot_mode': _cot_mode if _cot_budget > 0 else 'none',
+                        'cot_budget': _plan.budget,
+                        'cot_mode': _plan.mode if _plan.has_turn else 'none',
+                        'cot_prompt_mode': _plan.prompt_mode,
+                        'cot_label': _plan.label,
                         'reasoning_text': _reasonings[i],
                         'reasoning_tokens': _reasoning_tokens[i],
                         # footprint: prefix cache, and prefix + everything decoded
@@ -1242,17 +1359,18 @@ class QAEvaluator:
                         batch_start, _seen = _seen, _seen + len(batch_questions)
 
                         # Format prompts
-                        _cot_budget, _cot_mode, _cot_filler = (
-                            _cot_config(batch_questions[0]) if is_ruler_eval
-                            else (0, 'reason', ''))
+                        _plan = (_cot_plan(batch_questions[0]) if is_ruler_eval
+                                 else _CotPlan(has_turn=False, generate=False,
+                                               stage1_cap=0, instruction='',
+                                               fill_tokens=0, filler_unit='',
+                                               mode='reason', prompt_mode='',
+                                               budget=0, label='cot0'))
                         prompts = []
                         _q_contents = []
                         for q in batch_questions:
                             question_text = q['question']
                             if is_ruler_eval:
-                                question_text = question_text + (
-                                    _COT_INSTRUCTION if _cot_budget > 0
-                                    else _NO_COT_INSTRUCTION)
+                                question_text = question_text + _plan.instruction
                                 question_formatted = format_question(
                                     self.tokenizer,
                                     question_text,
@@ -1292,16 +1410,16 @@ class QAEvaluator:
                         # the same tail-only scoring or it is not on the same surface.
                         _suffixes = [q.get('forced_answer_suffix', '')
                                      for q in batch_questions]
-                        if _cot_budget <= 0:
+                        if not _plan.has_turn:
                             _reasonings = [''] * len(prompts)
-                        elif _cot_mode == 'filler':
-                            _reasonings = [_filler_text(self.tokenizer, _cot_budget, _cot_filler)] \
-                                * len(prompts)
+                        elif _plan.mode == 'filler':
+                            _reasonings = [_filler_text(self.tokenizer, _plan.fill_tokens,
+                                                        _plan.filler_unit)] * len(prompts)
                         else:
                             _reasonings = generate_with_vllm_batch(
                                 vllm_model=self.vllm_model,
                                 full_prompts=prompts,
-                                max_new_tokens=_cot_budget,
+                                max_new_tokens=_plan.stage1_cap,
                                 temperature=gen_params['temperature'],
                                 top_k=gen_params['top_k'],
                                 top_p=gen_params['top_p'],
@@ -1310,7 +1428,7 @@ class QAEvaluator:
                             len(self.tokenizer.encode(r, add_special_tokens=False)) if r else 0
                             for r in _reasonings
                         ]
-                        if _cot_budget <= 0:
+                        if not _plan.has_turn:
                             prompts = [pp + sfx for pp, sfx in zip(prompts, _suffixes)]
                         else:
                             prompts = [
@@ -1318,9 +1436,10 @@ class QAEvaluator:
                                     self.tokenizer, qc, r, self.model_name, sfx)
                                 for qc, r, sfx in zip(_q_contents, _reasonings, _suffixes)
                             ]
-                        if _cot_budget > 0:
-                            print(f"  [cot] mode={_cot_mode} budget={_cot_budget} "
-                                  f"used={_reasoning_tokens}")
+                        if _plan.has_turn:
+                            print(f"  [cot] label={_plan.label} mode={_plan.mode} "
+                                  f"prompt_mode={_plan.prompt_mode or '-'} "
+                                  f"cap={_plan.stage1_cap} used={_reasoning_tokens}")
 
                         answers = generate_with_vllm_batch(
                             vllm_model=self.vllm_model,
@@ -1364,8 +1483,10 @@ class QAEvaluator:
                                     'num_generated_tokens': num_gen_tokens,
                                     'time_per_token': time_per_token,
                                     # ---- Phase 1 ---------------------------------
-                                    'cot_budget': _cot_budget,
-                                    'cot_mode': _cot_mode if _cot_budget > 0 else 'none',
+                                    'cot_budget': _plan.budget,
+                                    'cot_mode': _plan.mode if _plan.has_turn else 'none',
+                                    'cot_prompt_mode': _plan.prompt_mode,
+                                    'cot_label': _plan.label,
                                     'reasoning_text': _reasonings[i],
                                     'reasoning_tokens': _reasoning_tokens[i],
                                     'prefix_cache_elems': _prefix_elems,

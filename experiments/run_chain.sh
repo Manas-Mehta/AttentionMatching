@@ -23,6 +23,14 @@ METHOD="${METHOD:-am}"
 COT_BUDGET="${COT_BUDGET:-0}"
 COT_MODE="${COT_MODE:-reason}"
 COT_FILLER="${COT_FILLER:- ...}"
+# Method A (prompt modes): set COT_PROMPT to immediate|brief|moderate|long to run
+# the model in a mode with NO hard cap. The budget is then measured, not imposed.
+# COT_CEILING is a runaway guard on the reasoning stage, not a budget. When a prompt
+# mode is set it overrides COT_BUDGET entirely. COT_FILLER_TARGET is the token count
+# for a prompt mode's filler twin (the measured mean of its paired reason run).
+COT_PROMPT="${COT_PROMPT:-}"
+COT_CEILING="${COT_CEILING:-2048}"
+COT_FILLER_TARGET="${COT_FILLER_TARGET:-0}"
 N="${N:-50}"
 MAXLEN="${MAXLEN:-16384}"
 OUTROOT="${OUTROOT:-chain}"
@@ -49,8 +57,13 @@ else
   METHODS="highest_attn_keys_rms_nnls2_-3_3_lsq_on-policy"
 fi
 
-# Cell tag: budget and mode are part of the identity, so nothing clobbers anything.
-if [ "$COT_BUDGET" -eq 0 ]; then CELL="cot0"; else CELL="cot${COT_BUDGET}_${COT_MODE}"; fi
+# Cell tag: budget/mode (legacy) or prompt-mode (method A) are part of the identity,
+# so nothing clobbers anything. Must match _CotPlan.label in qa_evaluator.py.
+if [ -n "$COT_PROMPT" ]; then
+  if [ "$COT_PROMPT" = "immediate" ]; then CELL="mode${COT_PROMPT}"
+  else CELL="mode${COT_PROMPT}_${COT_MODE}"; fi
+elif [ "$COT_BUDGET" -eq 0 ]; then CELL="cot0"
+else CELL="cot${COT_BUDGET}_${COT_MODE}"; fi
 
 cd "$(dirname "$0")/../official"
 
@@ -59,10 +72,17 @@ cd "$(dirname "$0")/../official"
 export AM_COT_BUDGET="${COT_BUDGET}"
 export AM_COT_MODE="${COT_MODE}"
 export AM_COT_FILLER="${COT_FILLER}"
+export AM_COT_PROMPT="${COT_PROMPT}"
+export AM_COT_CEILING="${COT_CEILING}"
+export AM_COT_FILLER_TARGET="${COT_FILLER_TARGET}"
 
 echo "=== chain cell: ${TASK} | ${RATIO} | ${CELL} | n=${N} ==="
 echo "    method=${METHODS}"
-echo "    AM_COT_BUDGET=${AM_COT_BUDGET} AM_COT_MODE=${AM_COT_MODE}"
+if [ -n "$COT_PROMPT" ]; then
+  echo "    AM_COT_PROMPT=${AM_COT_PROMPT} AM_COT_MODE=${AM_COT_MODE} ceiling=${AM_COT_CEILING} filler_target=${AM_COT_FILLER_TARGET} (no hard cap)"
+else
+  echo "    AM_COT_BUDGET=${AM_COT_BUDGET} AM_COT_MODE=${AM_COT_MODE} (fixed cap)"
+fi
 
 python -u -m evaluation.run_qa_evaluation \
   --model-name Qwen/Qwen3-4B-Instruct-2507 \
