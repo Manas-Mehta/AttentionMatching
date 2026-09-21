@@ -297,11 +297,14 @@ def _cot_plan(question: Optional[Dict] = None) -> _CotPlan:
     import os
     budget, mode, filler_unit = _cot_config(question)
     prompt_mode = os.environ.get('AM_COT_PROMPT', '').strip().lower()
+    # A probe pins its own budget to 0: it must stay a single forward pass (no CoT),
+    # even under a prompt mode, or it stops measuring single-pass reachability.
+    probe_pinned = question is not None and question.get('cot_budget') == 0
 
     if prompt_mode:                                    # method A
         ceiling = int(os.environ.get('AM_COT_CEILING', '2048'))
         fill_target = int(os.environ.get('AM_COT_FILLER_TARGET', '0'))
-        has_turn = prompt_mode != 'immediate'
+        has_turn = prompt_mode != 'immediate' and not probe_pinned
         instruction = _PROMPT_MODE_INSTRUCTION.get(prompt_mode, _COT_INSTRUCTION)
         return _CotPlan(
             has_turn=has_turn,
