@@ -1,9 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=chain
 #SBATCH --account=ny_gdurrett_training
-#SBATCH --partition=nyu,alpha          # both map to alphagpu nodes; alpha adds 51-54
-                                       # (RTX PRO 6000, 96GB). Slurm starts the job in
-                                       # whichever partition frees a GPU first.
+#SBATCH --partition=alpha              # the 'nyu' partition was retired; 'alpha' is the
+                                       # GPU partition (H100 / H200 / RTX PRO 6000).
+                                       # NOTE: a --gres=gpu:1 job is governance-routed to
+                                       # the slow RTX6000 pool (~24h wait). Submit with
+                                       # --gres=gpu:2 to land on the free H100/H200 pool.
 #SBATCH --qos=priority
 #SBATCH --exclude=alphagpu01,alphagpu02,alphagpu06,alphagpu08,alphagpu10,alphagpu11,alphagpu20,alphagpu24
 #SBATCH --nodes=1
