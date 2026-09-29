@@ -45,14 +45,22 @@ export CACHE_STORE="${CACHE_STORE:-}"
 # Everything scratch-side. The login and compute nodes share a small /tmp ramdisk
 # that other users fill, and torch/vllm/triton all spill compile caches there by
 # default, which is a silent way to lose a long job to ENOSPC.
-export TMPDIR="${SCRATCH}/tmp"
-export TRITON_CACHE_DIR="${SCRATCH}/tmp/triton"
-export VLLM_CACHE_ROOT="${SCRATCH}/tmp/vllm"
-export TORCHINDUCTOR_CACHE_DIR="${SCRATCH}/tmp/inductor"
-export XDG_CACHE_HOME="${SCRATCH}/.cache"
-export MPLCONFIGDIR="${SCRATCH}/tmp/mpl"
+#
+# The compile caches (triton/inductor/vllm) MUST be per-job. When several vLLM cells
+# cold-start at once they otherwise race to write the same torch_compile_cache entry
+# and one loses with OSError Errno 521 on a half-written .cubin. HF_HOME stays shared
+# (model weights are read-only once downloaded, so concurrent reads are safe).
+JOBTMP="${SCRATCH}/tmp/job_${SLURM_JOB_ID:-$$}"
+export TMPDIR="${JOBTMP}"
+export TRITON_CACHE_DIR="${JOBTMP}/triton"
+export VLLM_CACHE_ROOT="${JOBTMP}/vllm"
+export TORCHINDUCTOR_CACHE_DIR="${JOBTMP}/inductor"
+export XDG_CACHE_HOME="${JOBTMP}/.cache"
+export MPLCONFIGDIR="${JOBTMP}/mpl"
 mkdir -p "$TMPDIR" "$TRITON_CACHE_DIR" "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" \
          "$XDG_CACHE_HOME" "$MPLCONFIGDIR"
+# The per-job cache is scratch space, not a result; drop it when the job exits.
+trap 'rm -rf "${JOBTMP}" 2>/dev/null || true' EXIT
 
 
 cd "${PROJECT_DIR}"
@@ -75,9 +83,12 @@ printf '\n=== done: rc=%d, %dh %dm %ds ===\n' "$rc" \
   $((elapsed/3600)) $(((elapsed%3600)/60)) $((elapsed%60))
 
 GPUNAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | tr ' ' '_')"
-printf 'chain\t%s\t%s_%s_cot%s_%s\t%s\t%d\t%d\t%s\n' \
+# Trailing columns (outroot, query config, prompt mode, method) were added 2026-09-28;
+# the label column alone cannot tell prompt modes or query sets apart.
+printf 'chain\t%s\t%s_%s_cot%s_%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n' \
   "${SLURM_JOB_ID:-local}" "${TASK:-d}" "${TARGET_SIZE:-d}" "${COT_BUDGET:-0}" \
   "${COT_MODE:-reason}" "${GPUNAME:-unknown}" "$elapsed" "$rc" "$(date -Iseconds)" \
+  "${OUTROOT:-chain}" "${QUERY_CONFIG:-repeat}" "${COT_PROMPT:-none}" "${METHOD:-am}" \
   >> results/timings.tsv
 
 exit $rc

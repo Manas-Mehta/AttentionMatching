@@ -34,6 +34,7 @@ COT_FILLER_TARGET="${COT_FILLER_TARGET:-0}"
 N="${N:-50}"
 MAXLEN="${MAXLEN:-16384}"
 OUTROOT="${OUTROOT:-chain}"
+QUERY_CONFIG="${QUERY_CONFIG:-repeat}"   # repeat-prefill (default) | self-study
 STATS="${STATS:-1}"
 VERBOSE="${VERBOSE:-0}"
 CHUNKING="${CHUNKING:-fixed}"
@@ -93,7 +94,7 @@ python -u -m evaluation.run_qa_evaluation \
   --max-new-tokens 128 \
   --methods ${METHODS} \
   --target-size "${TARGET_SIZE}" \
-  --query-config repeat \
+  --query-config "${QUERY_CONFIG}" \
   --algorithm-config best \
   --precomputed-budget-path head_budget_optimization/head_budgets/Qwen3-4B-Instruct-2507/optimized_agnostic.json \
   --max-ratio-per-head 0.95 \
