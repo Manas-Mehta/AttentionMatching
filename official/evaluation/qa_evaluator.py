@@ -64,6 +64,12 @@ def chain_score_prediction(pred: str, refs: List[str], candidates: List[str]) ->
     The loader removes from `candidates` any name that appears in the question, so a
     probe echoing its own premise is not counted as an extra guess.
     """
+    found = _candidates_found(pred, candidates)
+    return 1.0 if found == {r.lower() for r in refs} else 0.0
+
+
+def _candidates_found(pred: str, candidates: List[str]) -> set:
+    """Lower-cased candidates that occur in `pred` as whole words."""
     import re as _re
     found = set()
     for c in candidates:
@@ -72,7 +78,22 @@ def chain_score_prediction(pred: str, refs: List[str], candidates: List[str]) ->
             pat = _WORD_RE_CACHE[c] = _re.compile(r"\b" + _re.escape(c) + r"\b", _re.I)
         if pat.search(pred):
             found.add(c.lower())
-    return 1.0 if found == {r.lower() for r in refs} else 0.0
+    return found
+
+
+def set_overlap_score(pred: str, q: Dict) -> Optional[float]:
+    """Partial credit for candidate-scored questions: |found & gold| / max(|found|, |gold|).
+
+    For the mixed cwe question (5 gold words among 25-64 distinct list words), 4 of 5
+    right scores 0.8, and listing every word scores 0.08-0.20 rather than 1.0. Equals the
+    exact-set score whenever that is 1. None when the question has no candidates.
+    """
+    candidates = q.get('score_candidates')
+    if not candidates:
+        return None
+    gold = {r.lower() for r in q.get('ruler_outputs', [])}
+    found = _candidates_found(pred, candidates)
+    return len(found & gold) / max(len(found), len(gold), 1)
 
 
 def score_ruler_question(pred: str, q: Dict) -> float:
@@ -173,15 +194,27 @@ _COT_INSTRUCTION = (
 # Measured on the first 16x smoke cell: every answer was followed by "Explanation:".
 # Saying the same thing here that _FORCE_ANSWER_TURN says keeps the output format
 # identical across budgets, which is what makes the cells comparable.
-_NO_COT_INSTRUCTION = (
-    "\n\nOutput only the variable name or names, comma separated, with no "
+# The answer-format line is per question: the mixed loader sets `answer_format` per
+# type (uuid, number, True/False, ...). Questions without one (the chain task) get the
+# chain wording, so chain prompts are byte-identical to before.
+_CHAIN_ANSWER_FORMAT = (
+    "Output only the variable name or names, comma separated, with no "
     "explanation and nothing else."
 )
+_NO_COT_INSTRUCTION = "\n\n" + _CHAIN_ANSWER_FORMAT
 
-_FORCE_ANSWER_TURN = (
-    "Stop reasoning now and give your final answer. Output only the variable name or "
-    "names, comma separated, with no explanation and nothing else."
-)
+_FORCE_ANSWER_TURN = "Stop reasoning now and give your final answer. " + _CHAIN_ANSWER_FORMAT
+
+
+def _answer_format(question: Optional[Dict]) -> str:
+    return (question or {}).get('answer_format') or _CHAIN_ANSWER_FORMAT
+
+
+def _question_instruction(plan: "_CotPlan", question: Dict) -> str:
+    """Line appended to the question: the mode's reasoning instruction when there is a
+    reasoning turn, else this question's answer format (== _NO_COT_INSTRUCTION for
+    chain questions)."""
+    return plan.instruction if plan.has_turn else "\n\n" + _answer_format(question)
 
 # --- Method A: prompt modes (no hard cap) ----------------------------------
 # "Trading Memory for Compute", budget-forcing revision. Rather than truncate the
@@ -218,12 +251,15 @@ _PROMPT_MODE_INSTRUCTION = {
 }
 
 
-def _force_answer_prompt(tokenizer, question_content, reasoning, model_name, suffix):
+def _force_answer_prompt(tokenizer, question_content, reasoning, model_name, suffix,
+                         answer_format=None):
     """Reasoning as a closed assistant turn, then a user turn asking only for the answer."""
+    turn = (_FORCE_ANSWER_TURN if not answer_format else
+            "Stop reasoning now and give your final answer. " + answer_format)
     messages = [
         {"role": "user", "content": question_content},
         {"role": "assistant", "content": reasoning},
-        {"role": "user", "content": _FORCE_ANSWER_TURN},
+        {"role": "user", "content": turn},
     ]
     out = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
@@ -243,6 +279,33 @@ def _kv_elems_per_token(model) -> int:
     kv_heads = getattr(cfg, 'num_key_value_heads', cfg.num_attention_heads)
     head_dim = getattr(cfg, 'head_dim', None) or (cfg.hidden_size // cfg.num_attention_heads)
     return 2 * cfg.num_hidden_layers * kv_heads * head_dim
+
+def _timing_memory_fields(plan, reasoning_tokens, t_reason, t_answer, batch_n,
+                          prefix_elems, suffix_tokens, per_token_elems, elem_bytes,
+                          gpu_peak_bytes=None) -> Dict:
+    """Per-question CoT timing and memory, in seconds and bytes.
+
+    Times are batch wall clock: the questions in a batch share one decode, so
+    `reasoning_time_batch` / `answer_time_batch` are the batch's stage-1 / stage-2 times
+    and `batch_n` is how many questions shared them. `gpu_peak_alloc_batch_bytes` is the
+    measured torch peak over both stages (includes the model weights); None on the vLLM
+    path, where vLLM preallocates its own pool.
+    """
+    ceiling = plan.stage1_cap if plan.generate else 0
+    return {
+        'reasoning_time_batch': t_reason,
+        'answer_time_batch': t_answer,
+        'batch_n': batch_n,
+        'cot_ceiling': ceiling,
+        # re-encoding the decoded reasoning can come out a few tokens short of the cap
+        'hit_ceiling': bool(ceiling) and reasoning_tokens >= ceiling - 8,
+        'bytes_per_elem': elem_bytes,
+        'prefix_cache_bytes': prefix_elems * elem_bytes,
+        'cot_kv_bytes': reasoning_tokens * per_token_elems * elem_bytes,
+        'peak_total_bytes': (prefix_elems + suffix_tokens * per_token_elems) * elem_bytes,
+        'gpu_peak_alloc_batch_bytes': gpu_peak_bytes,
+    }
+
 
 # Only the chain loader sets a forced-answer suffix. Everything else defaults to
 # empty, so existing RULER / keylen runs keep byte-identical prompts.
@@ -507,7 +570,7 @@ class QAEvaluator:
                 _plan = _cot_plan(batch_questions[0])
                 # Ask for reasoning only when there is a turn to spend on it.
                 _q_contents = [
-                    q['question'] + _plan.instruction
+                    q['question'] + _question_instruction(_plan, q)
                     for q in batch_questions
                 ]
                 formatted_questions = [
@@ -557,11 +620,20 @@ class QAEvaluator:
             # anywhere in the thinking, which would manufacture the result.
             _suffixes = [q.get('forced_answer_suffix', '')
                          for q in batch_questions]
+            _gpu_peak = None
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats(device)
+            except Exception:
+                pass
+            _t_reason0 = time.time()
             if not _plan.has_turn:
                 _reasonings = [''] * actual_batch_size
             elif _plan.mode == 'filler':
-                _reasonings = [_filler_text(self.tokenizer, _plan.fill_tokens,
-                                            _plan.filler_unit)] * actual_batch_size
+                # per-question length when the loader paired this run with a reason run
+                _reasonings = [_filler_text(self.tokenizer,
+                                            int(q.get('cot_fill_tokens', _plan.fill_tokens)),
+                                            _plan.filler_unit) for q in batch_questions]
             else:
                 # No hard cap under a prompt mode: stage1_cap is a safety ceiling, the
                 # model stops on its own, and the budget is the measured length below.
@@ -573,6 +645,7 @@ class QAEvaluator:
                     max_new_tokens=_plan.stage1_cap,
                     original_seq_len=seq_len,
                 )
+            _t_reason = time.time() - _t_reason0
             _reasoning_tokens = [
                 len(self.tokenizer.encode(r, add_special_tokens=False)) if r else 0
                 for r in _reasonings
@@ -582,14 +655,17 @@ class QAEvaluator:
                                  in zip(formatted_questions, _suffixes)]
             else:
                 final_prompts = [
-                    _force_answer_prompt(self.tokenizer, qc, r, self.model_name, sfx)
-                    for qc, r, sfx in zip(_q_contents, _reasonings, _suffixes)
+                    _force_answer_prompt(self.tokenizer, qc, r, self.model_name, sfx,
+                                         q.get('answer_format'))
+                    for qc, r, sfx, q in zip(_q_contents, _reasonings, _suffixes,
+                                             batch_questions)
                 ]
             if _plan.has_turn:
                 print(f"  [cot] label={_plan.label} mode={_plan.mode} "
                       f"prompt_mode={_plan.prompt_mode or '-'} cap={_plan.stage1_cap} "
                       f"used={_reasoning_tokens}")
 
+            _t_answer0 = time.time()
             answers = generate_with_compacted_cache_batch(
                 model=self.model,
                 tokenizer=self.tokenizer,
@@ -598,6 +674,13 @@ class QAEvaluator:
                 max_new_tokens=batch_max_new_tokens,
                 original_seq_len=seq_len,
             )
+            _t_answer = time.time() - _t_answer0
+            try:
+                if torch.cuda.is_available():
+                    _gpu_peak = int(torch.cuda.max_memory_allocated(device))
+            except Exception:
+                _gpu_peak = None
+            _elem_bytes = cache_for_generation[0][0].element_size()
             # [MULTISAMPLE] extra decoding passes off the SAME cache.
             # answers[] above stays sample #1 at temperature 0.7 so existing
             # results remain comparable. prompts * k gives k samples in one
@@ -692,6 +775,7 @@ class QAEvaluator:
                         'greedy_is_correct': _g_ok,
                         'ruler_score': score,
                         'ruler_score_substring': _substr_score,
+                        'set_overlap': set_overlap_score(answer, q),
                         'is_correct': is_correct,
                         'generation_time': gen_time / actual_batch_size,
                         'num_generated_tokens': num_gen_tokens,
@@ -710,11 +794,17 @@ class QAEvaluator:
                         'peak_total_elems': _prefix_elems
                                             + (_prompt_tokens_i + num_gen_tokens)
                                             * _per_token_elems,
-                        # per-instance labels, copied through by the chain loader
+                        **_timing_memory_fields(
+                            _plan, _reasoning_tokens[i], _t_reason, _t_answer,
+                            actual_batch_size, _prefix_elems,
+                            _prompt_tokens_i + num_gen_tokens, _per_token_elems,
+                            _elem_bytes, _gpu_peak),
+                        # per-instance labels, copied through by the chain / mixed loaders
                         **{k: q[k] for k in (
                             'is_probe', 'probe_kind', 'probe_chain', 'probe_step',
                             'depth', 'breadth', 'hops', 'name_style', 'haystack',
                             'question_form', 'ctx_tokens', 'doc_index',
+                            'qtype', 'logic_kind', 'cot_fill_tokens',
                         ) if k in q},
                     }
                 elif is_qasper_eval:
@@ -1373,7 +1463,7 @@ class QAEvaluator:
                         for q in batch_questions:
                             question_text = q['question']
                             if is_ruler_eval:
-                                question_text = question_text + _plan.instruction
+                                question_text = question_text + _question_instruction(_plan, q)
                                 question_formatted = format_question(
                                     self.tokenizer,
                                     question_text,
@@ -1413,11 +1503,14 @@ class QAEvaluator:
                         # the same tail-only scoring or it is not on the same surface.
                         _suffixes = [q.get('forced_answer_suffix', '')
                                      for q in batch_questions]
+                        _t_reason0 = time.time()
                         if not _plan.has_turn:
                             _reasonings = [''] * len(prompts)
                         elif _plan.mode == 'filler':
-                            _reasonings = [_filler_text(self.tokenizer, _plan.fill_tokens,
-                                                        _plan.filler_unit)] * len(prompts)
+                            _reasonings = [_filler_text(
+                                self.tokenizer,
+                                int(q.get('cot_fill_tokens', _plan.fill_tokens)),
+                                _plan.filler_unit) for q in batch_questions]
                         else:
                             _reasonings = generate_with_vllm_batch(
                                 vllm_model=self.vllm_model,
@@ -1427,6 +1520,7 @@ class QAEvaluator:
                                 top_k=gen_params['top_k'],
                                 top_p=gen_params['top_p'],
                             )
+                        _t_reason = time.time() - _t_reason0
                         _reasoning_tokens = [
                             len(self.tokenizer.encode(r, add_special_tokens=False)) if r else 0
                             for r in _reasonings
@@ -1436,14 +1530,17 @@ class QAEvaluator:
                         else:
                             prompts = [
                                 context_for_generation + _force_answer_prompt(
-                                    self.tokenizer, qc, r, self.model_name, sfx)
-                                for qc, r, sfx in zip(_q_contents, _reasonings, _suffixes)
+                                    self.tokenizer, qc, r, self.model_name, sfx,
+                                    q.get('answer_format'))
+                                for qc, r, sfx, q in zip(_q_contents, _reasonings,
+                                                         _suffixes, batch_questions)
                             ]
                         if _plan.has_turn:
                             print(f"  [cot] label={_plan.label} mode={_plan.mode} "
                                   f"prompt_mode={_plan.prompt_mode or '-'} "
                                   f"cap={_plan.stage1_cap} used={_reasoning_tokens}")
 
+                        _t_answer0 = time.time()
                         answers = generate_with_vllm_batch(
                             vllm_model=self.vllm_model,
                             full_prompts=prompts,
@@ -1452,7 +1549,11 @@ class QAEvaluator:
                             top_k=gen_params['top_k'],
                             top_p=gen_params['top_p'],
                         )
+                        _t_answer = time.time() - _t_answer0
                         gen_time = time.time() - gen_start
+                        # KV dtype = model dtype; the HF copy is offloaded but keeps it
+                        _elem_bytes = (next(self.model.parameters()).element_size()
+                                       if self.model is not None else 2)
 
                         # Process results
                         for i, (q, answer) in enumerate(zip(batch_questions, answers)):
@@ -1481,6 +1582,7 @@ class QAEvaluator:
                                     'model_answer_text': answer,
                                     'ruler_score': score,
                                     'ruler_score_substring': _substr_score,
+                                    'set_overlap': set_overlap_score(answer, q),
                                     'is_correct': is_correct,
                                     'generation_time': per_question_time,
                                     'num_generated_tokens': num_gen_tokens,
@@ -1497,11 +1599,17 @@ class QAEvaluator:
                                     'peak_total_elems': _prefix_elems
                                                         + (_prompt_tokens_i + num_gen_tokens)
                                                         * _per_token_elems,
+                                    **_timing_memory_fields(
+                                        _plan, _reasoning_tokens[i], _t_reason, _t_answer,
+                                        len(batch_questions), _prefix_elems,
+                                        _prompt_tokens_i + num_gen_tokens,
+                                        _per_token_elems, _elem_bytes, None),
                                     **{k: q[k] for k in (
                                         'is_probe', 'probe_kind', 'probe_chain',
                                         'probe_step', 'depth', 'breadth', 'hops',
                                         'name_style', 'haystack', 'question_form',
-                                        'ctx_tokens', 'doc_index',
+                                        'ctx_tokens', 'doc_index', 'qtype', 'logic_kind',
+                                        'cot_fill_tokens',
                                     ) if k in q},
                                 })
                             elif is_qasper_eval:
@@ -3245,6 +3353,24 @@ class QAEvaluator:
 
                 all_results.append(result)
 
+                # [partial] Timeout insurance. The full JSON is written only after the last
+                # article, so a job killed at its time limit would lose every trace. Rewrite
+                # the results so far after each article; removed once the final JSON exists.
+                # '.json.partial' so that '*.json' globs in the analysis never pick it up.
+                try:
+                    _partial_path = Path(log_dir) / f"{experiment_name or 'qa_evaluation'}.json.partial"
+                    _partial_path.parent.mkdir(parents=True, exist_ok=True)
+                    _partial_tmp = Path(str(_partial_path) + '.tmp')
+                    with open(_partial_tmp, 'w') as _fh:
+                        json.dump({'partial': True, 'dataset_name': dataset_name,
+                                   'target_size': target_size,
+                                   'n_articles_done': len(all_results),
+                                   'n_articles_total': len(article_indices),
+                                   'results': all_results}, _fh)
+                    _partial_tmp.replace(_partial_path)
+                except Exception as _e:
+                    print(f"[partial] WARNING: could not write partial results: {_e}")
+
         # Save results
         log_path = Path(log_dir)
         log_path.mkdir(parents=True, exist_ok=True)
@@ -3308,6 +3434,10 @@ class QAEvaluator:
 
         with open(filepath, 'w') as f:
             json.dump(output, f, indent=2)
+        try:
+            (log_path / f"{experiment_name or 'qa_evaluation'}.json.partial").unlink(missing_ok=True)
+        except Exception:
+            pass
 
         # Log overall results
         self._log_overall_results(overall_stats, compaction_methods)

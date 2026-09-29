@@ -882,6 +882,134 @@ def load_chain_data(task: str) -> List[Dict]:
     return data
 
 
+# Answer-format line for the mixed dataset, one per question type. It goes where the
+# chain task's "Output only the variable name or names..." line goes: after the question
+# when there is no reasoning turn, and in the forced-answer turn when there is. The chain
+# types keep the chain wording verbatim so they read exactly as in the chain runs.
+_CHAIN_FORMAT = ("Output only the variable name or names, comma separated, with no "
+                 "explanation and nothing else.")
+MIXED_ANSWER_FORMAT = {
+    'uuid': "Output only the uuid, with no explanation and nothing else.",
+    'multikey': "Output only the number, with no explanation and nothing else.",
+    'chain_last': _CHAIN_FORMAT,
+    'chain_hop': _CHAIN_FORMAT,
+    'cwe': ("Output only the {n} words, comma separated, with no explanation and "
+            "nothing else."),
+    'logic': "Output only True or False, with no explanation and nothing else.",
+}
+
+# Stand-in document for the no-context floor. Not empty: compute_article_indices
+# locates the article inside the formatted context by substring.
+_NO_CONTEXT_ARTICLE = "No document is provided."
+
+
+def load_mixed_data(task: str) -> List[Dict]:
+    """
+    Load the mixed-task dataset (§B8: "Trading Memory for Compute", Idea 1).
+
+    Reads ``data/mixed/{task}.jsonl``, produced by ``experiments/make_mixed_data.py``.
+    One document holds prose filler plus a UUID needle, key-value needles, a variable
+    chain, a word list and a SimpleLogic block, and carries 21-36 questions about them.
+    All questions run against the same cache.
+
+    Differences from ``load_chain_data``:
+      * ``score_candidates`` are used as stored. The generator already removed names the
+        question itself mentions. Re-stripping here would empty the logic candidates,
+        since every logic question contains "True" and "False".
+      * No question is pinned to zero reasoning: every type gets the cell's prompt mode.
+      * ``task`` is the question type, so the per-task summary is per type.
+
+    Suffixes (combinable, in this order):
+      ``_nologic``  drop the logic questions. The logic block stays in the document, so
+                    it still competes for the cache; only its questions are not asked.
+      ``_noctx``    the no-context floor: the document is replaced by a one-line stand-in.
+    """
+    base = task
+    no_context = base.endswith('_noctx')
+    if no_context:
+        base = base[:-len('_noctx')]
+    no_logic = base.endswith('_nologic')
+    if no_logic:
+        base = base[:-len('_nologic')]
+    fp = Path('data/mixed') / f'{base}.jsonl'
+    if not fp.exists():
+        raise ValueError(
+            f"Mixed dataset not found: {fp}. Generate it first with "
+            f"`python experiments/make_mixed_data.py`."
+        )
+    rows = []
+    with open(fp) as f:
+        for line in f:
+            if line.strip():
+                rows.append(json.loads(line))
+    if not rows:
+        raise ValueError(f"No rows in {fp}")
+
+    data = []
+    for idx, row in enumerate(rows):
+        questions = []
+        for q in row['questions']:
+            if no_logic and q['qtype'] == 'logic':
+                continue
+            fmt = MIXED_ANSWER_FORMAT[q['qtype']].format(n=len(q['answer']))
+            questions.append({
+                'question': q['question'],
+                'score_candidates': list(q['score_candidates']),
+                'ruler_outputs': q['answer'],
+                'answer_prefix': '',
+                'answer_format': fmt,
+                'forced_answer_suffix': row.get('forced_answer_suffix', '\nFinal answer:'),
+                'max_new_tokens': q['max_new_tokens'],
+                'task': q['qtype'],
+                'question_unique_id': q['qid'],
+                'is_probe': False,
+                'qtype': q['qtype'],
+                'logic_kind': q.get('logic_kind'),
+                'depth': q.get('depth'),
+                'ctx_tokens': row['ctx_tokens'],
+                'doc_index': row['doc_index'],
+            })
+        data.append({
+            'article_id': f"{task}_{idx}",
+            'title': f"mixed {task} (document {idx})",
+            'article': _NO_CONTEXT_ARTICLE if no_context else row['context'],
+            'questions': questions,
+        })
+
+    # Filler control (proposal §5), per-question twin: AM_COT_FILLER_FROM names the paired
+    # reason run's result JSON (or its directory). Each question is padded to exactly the
+    # CoT length it had there, because lengths differ ~20x across types (uuid vs cwe) and a
+    # single per-cell length would not be a twin for any of them.
+    import os
+    filler_from = os.environ.get('AM_COT_FILLER_FROM', '').strip()
+    if filler_from:
+        src = Path(filler_from)
+        if src.is_dir():
+            finals = sorted(p for p in src.glob('*.json') if 'summary' not in p.name)
+            if not finals:
+                raise ValueError(f"AM_COT_FILLER_FROM: no result JSON in {src}")
+            src = finals[-1]
+        paired = json.load(open(src))
+        lengths = {r['question_id']: int(r.get('reasoning_tokens') or 0)
+                   for a in paired['results'] for r in a['qa_results']['results_per_question']}
+        missing = [q['question_unique_id'] for d in data for q in d['questions']
+                   if q['question_unique_id'] not in lengths]
+        if missing:
+            raise ValueError(f"AM_COT_FILLER_FROM {src}: {len(missing)} questions not in the "
+                             f"paired run (e.g. {missing[:3]})")
+        for d in data:
+            for q in d['questions']:
+                q['cot_fill_tokens'] = lengths[q['question_unique_id']]
+        print(f"Filler twin of {src}: per-question lengths, mean "
+              f"{sum(lengths.values()) / max(1, len(lengths)):.0f} tokens")
+
+    n_q = sum(len(d['questions']) for d in data)
+    print(f"Loaded {len(data)} mixed articles for {task} ({n_q} questions"
+          f"{', no logic questions' if no_logic else ''}"
+          f"{', NO CONTEXT' if no_context else ''})")
+    return data
+
+
 def load_qasper_data() -> List[Dict]:
     """
     Load QASPER dataset from HuggingFace.
@@ -1123,6 +1251,10 @@ def load_dataset(dataset_name: str, include_diagnosis: bool = True) -> List[Dict
         # Phase 1 entity-attribute chains, e.g. 'chain_d4_b1_word_prose_4k_last'
         return load_chain_data(dataset_name)
 
+    elif dataset_name.startswith('mixed'):
+        # §B8 mixed-task documents, e.g. 'mixed_v2_4k' or 'mixed_v2_4k_noctx'
+        return load_mixed_data(dataset_name)
+
     elif dataset_name.startswith('ruler'):
         # Parse context length and optional task filter from dataset name
         # Formats: 'ruler_4k', 'ruler_128k', 'ruler_4k_niah_single_1'
@@ -1225,9 +1357,9 @@ def is_perplexity_dataset(dataset_name: str) -> bool:
 # Datasets that use string-match evaluation + gold perplexity (RULER benchmark,
 # plus the 'keylen' sweep — real RULER niah_single_3 docs with the key swapped — and
 # the Phase 1 'chain' family, which is RULER variable_tracking with depth, breadth and
-# the two entropies opened up. All must go down the RULER scoring / gold-perplexity
-# path, not the MCQ path).
-RULER_DATASET_PREFIXES = ('ruler', 'keylen', 'chain')
+# the two entropies opened up, and the §B8 'mixed' documents. All must go down the
+# RULER scoring / gold-perplexity path, not the MCQ path).
+RULER_DATASET_PREFIXES = ('ruler', 'keylen', 'chain', 'mixed')
 RULER_DATASET_PREFIX = RULER_DATASET_PREFIXES[0]  # back-compat for any external refs
 
 
