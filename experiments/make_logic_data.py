@@ -45,9 +45,15 @@ PW_ENTITIES = ["Anne", "Bob", "Charlie", "Dave", "Erin", "Fiona", "Gary", "Harry
 # plain fixpoint and ProofWriter's stratified negation can differ; skipped, not fixed.
 PW_SKIP = {"AttNeg-CWA-D5-1186", "AttNeg-CWA-D5-189", "RelNeg-CWA-D5-45"}
 
+# Closed-world reading, as ProofWriter's CWA labels use it: an underivable fact is false, so
+# "X is not Y" is true exactly when "X is Y" cannot be derived. The first wording stated only
+# the first half; the model then marked underivable negated statements False (job 19387294:
+# 0.11 on those 200 questions vs 0.95-0.99 on the other kinds).
 PW_QUESTION = ('Based only on the facts and rules in the text, is the following statement '
-               'true? "{s}" Anything that cannot be derived from the facts and rules counts '
-               'as false. Answer True or False.')
+               'true? "{s}" Use the closed-world rule: any fact that cannot be derived from '
+               'the facts and rules is false. So a statement saying that something is not the '
+               'case is true exactly when the positive fact cannot be derived. '
+               'Answer True or False.')
 
 
 def word_re(w):
