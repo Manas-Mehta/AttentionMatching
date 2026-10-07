@@ -16,6 +16,7 @@ Three steps, so the heavy JSONs never leave the cluster:
   python experiments/analyze_mixed.py table   [--rows results/mixed_rows.csv]
   python experiments/analyze_mixed.py plot    [--rows ...] [--out ../Notes/figures/mixed]
   python experiments/analyze_mixed.py sig     [--rows ...] [--kinds] [--n 10000]
+  python experiments/analyze_mixed.py exchange [--rows ...]   Idea 1: what CoT buys per cell -> mixed_exchange.csv
 
 Scores are exact-set (`ruler_score`); `set_overlap` is the partial score (used for cwe).
 Accuracy is reported per question type only, never averaged across types (§B8b).
@@ -31,12 +32,13 @@ from collections import defaultdict
 
 TYPES = ['uuid', 'multikey', 'chain_last', 'chain_hop', 'cwe', 'logic']
 LOGIC_KINDS = ['stated_base', 'stated_derivable', 'derived', 'false']
-MODES = ['immediate', 'moderate', 'long']
+LOOKUP = ['uuid', 'multikey', 'chain_last', 'chain_hop', 'cwe']      # recall = these, per document
+MODES = ['immediate', 'brief', 'moderate', 'long']
 FILLER_MODES = ['moderate_filler', 'long_filler']          # matched-length twins (phase 2)
 MODE_ORDER = MODES + FILLER_MODES
-MODE_DIR = {'modeimmediate': 'immediate', 'modemoderate_reason': 'moderate',
-            'modelong_reason': 'long', 'modemoderate_filler': 'moderate_filler',
-            'modelong_filler': 'long_filler'}
+MODE_DIR = {'modeimmediate': 'immediate', 'modebrief_reason': 'brief',
+            'modemoderate_reason': 'moderate', 'modelong_reason': 'long',
+            'modemoderate_filler': 'moderate_filler', 'modelong_filler': 'long_filler'}
 RATIO_DIR = {'1x': 1, '4x': 4, '8x': 8, '16x': 16, '32x': 32, '64x': 64,
              'ts0.0078125': 128, 'ts0.00390625': 256}
 
@@ -128,6 +130,39 @@ def _load(rows_path):
     return rows
 
 
+def _attach_effective(rows, docs_path):
+    """Effective prefix and peak bytes per row, the AM paper's convention (§3.4, findings §B6).
+
+    `prefix_cache_bytes` counts the padded C_k / beta / C_v tensors (every head padded to its
+    layer's largest), 2.5-3.7x the effective size here. Effective prefix = the document's
+    effective article tokens (x 257/256 for beta, §3.1) + the uncompressed chat-template
+    tokens, times the KV bytes of one token. Peak = effective prefix + everything decoded after it.
+    """
+    if not os.path.exists(docs_path):
+        return
+    per_tok = next(r['cot_kv_bytes'] / float(r['reasoning_tokens']) for r in rows
+                   if r['cot_kv_bytes'] and r['reasoning_tokens'])
+    eff, orig = {}, {}
+    for d in csv.DictReader(open(docs_path)):
+        k = (d['qset'], int(d['ratio']), d['mode'], d['doc_index'])
+        eff[k], orig[d['doc_index']] = float(d['effective_article_tokens']), float(d['original_article_tokens'])
+    template = {r['doc_index']: r['prefix_cache_bytes'] / per_tok - orig[r['doc_index']]
+                for r in rows if r['qset'] == '1x' and r['prefix_cache_bytes'] and r['doc_index'] in orig}
+    for r in rows:
+        r['prefix_eff_bytes'] = r['peak_eff_bytes'] = None
+        if r['prefix_cache_bytes'] is None:
+            continue
+        if r['qset'] in ('1x', 'floor'):
+            pre = r['prefix_cache_bytes']
+        else:
+            e = eff.get((r['qset'], r['ratio'], r['mode'], r['doc_index']))
+            if e is None or r['doc_index'] not in template:
+                continue
+            pre = (e * 257 / 256 + template[r['doc_index']]) * per_tok
+        r['prefix_eff_bytes'] = pre
+        r['peak_eff_bytes'] = r['peak_total_bytes'] - r['prefix_cache_bytes'] + pre
+
+
 def _groups(rows):
     """(qset, ratio, mode, group) -> rows, group = question type or logic/<kind>."""
     g = defaultdict(list)
@@ -159,6 +194,23 @@ def _mean(xs):
     return sum(xs) / len(xs) if xs else None
 
 
+def _mb(xs):
+    m = _mean(xs)
+    return m / 1e6 if m is not None else None
+
+
+def _median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    k = len(xs) // 2
+    return xs[k] if len(xs) % 2 else (xs[k - 1] + xs[k]) / 2
+
+
+def _modes_present(summ):
+    return [m for m in MODES if any(s['mode'] == m for s in summ)]
+
+
 def summarize(rows):
     g = _groups(rows)
     out = []
@@ -177,19 +229,53 @@ def summarize(rows):
             overlap=_mean([r['overlap'] for r in rs]),
             recovery_vs_1x=(acc / base_acc) if base_acc else None,
             cot_tokens=_mean([r['reasoning_tokens'] for r in rs]),
+            # the 2,048 ceiling truncates capped CoTs, which pulls the mean down; the median
+            # moves only once more than half the questions hit the ceiling
+            cot_median=_median([r['reasoning_tokens'] for r in rs]),
             hit_ceiling=_mean([r['hit_ceiling'] for r in rs]),
             stored_mb=_mean([r['prefix_cache_bytes'] for r in rs]) / 1e6
             if _mean([r['prefix_cache_bytes'] for r in rs]) else None,
             cot_kv_mb=(_mean([r['cot_kv_bytes'] for r in rs]) or 0) / 1e6,
             peak_mb=(_mean([r['peak_total_bytes'] for r in rs]) or 0) / 1e6,
+            stored_eff_mb=_mb([r.get('prefix_eff_bytes') for r in rs]),
+            peak_eff_mb=_mb([r.get('peak_eff_bytes') for r in rs]),
             reason_s_per_q=_mean([r['reasoning_time_batch'] / r['batch_n'] for r in rs
                                   if r['reasoning_time_batch'] is not None and r['batch_n']]),
+            docs_all=None, docs_none=None,
         ))
+    return out + _recall(rows)
+
+
+def _recall(rows):
+    """Recall per document: the share of a document's lookup questions (uuid, 2 multikey,
+    chain_last, chain_hop, cwe) answered, averaged over documents. Logic is left out: a
+    True/False guess is right half the time, so a correct answer does not show the fact was kept.
+    Group 'recall'; docs_all / docs_none = documents with every / no lookup question right."""
+    by_cell = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        if r['qtype'] in LOOKUP:
+            by_cell[(r['qset'], r['ratio'], r['mode'])][r['doc_index']].append(r)
+    out = []
+    for (qset, ratio, mode), docs in sorted(by_cell.items(), key=lambda kv: (
+            ['1x', 'floor', 'R', 'SS'].index(kv[0][0]), kv[0][1], MODE_ORDER.index(kv[0][2]))):
+        per_doc = [dict(doc_index=d, score=_mean([r['score'] for r in rs])) for d, rs in docs.items()]
+        lo, hi = _boot_ci(per_doc)
+        out.append(dict(
+            qset=qset, ratio=ratio, mode=mode, group='recall',
+            n=sum(len(rs) for rs in docs.values()), n_docs=len(docs),
+            partial=max(r['partial'] for rs in docs.values() for r in rs),
+            acc=_mean([d['score'] for d in per_doc]), ci_lo=lo, ci_hi=hi, overlap=None,
+            recovery_vs_1x=None, cot_tokens=None, cot_median=None, hit_ceiling=None,
+            stored_mb=None, cot_kv_mb=None, peak_mb=None, stored_eff_mb=None, peak_eff_mb=None,
+            reason_s_per_q=None,
+            docs_all=sum(d['score'] >= 0.999 for d in per_doc),
+            docs_none=sum(d['score'] <= 0.001 for d in per_doc)))
     return out
 
 
 def table(args):
     rows = _load(args.rows)
+    _attach_effective(rows, os.path.join(os.path.dirname(args.rows) or '.', 'mixed_docs.csv'))
     summ = summarize(rows)
     path = os.path.join(os.path.dirname(args.rows) or '.', 'mixed_summary.csv')
     with open(path, 'w', newline='') as f:
@@ -199,11 +285,13 @@ def table(args):
     idx = {(s['qset'], s['ratio'], s['mode'], s['group']): s for s in summ}
     qsets = [q for q in ('R', 'SS') if any(s['qset'] == q for s in summ)]
     ratios = sorted({s['ratio'] for s in summ if s['qset'] in ('R', 'SS')})
-    cols = [(q, m) for q in qsets for m in MODES]
+    modes = _modes_present(summ)
+    cols = [(q, m) for q in qsets for m in modes]
     groups = TYPES + [f'logic/{k}' for k in LOGIC_KINDS]
     fmt = lambda s, k: '' if s is None or s.get(k) is None else (
         f"{s[k]:.2f}" + ('*' if s.get('partial') else ''))
-    for metric, label in (('acc', 'accuracy (exact)'), ('cot_tokens', 'mean CoT tokens')):
+    for metric, label in (('acc', 'accuracy (exact)'), ('cot_tokens', 'mean CoT tokens'),
+                          ('cot_median', 'median CoT tokens')):
         print(f"\n## {label}   (* = partial cell)\n")
         for grp in groups:
             if not any(s['group'] == grp for s in summ):
@@ -211,22 +299,19 @@ def table(args):
             print(f"### {grp}\n")
             print('| ratio | ' + ' | '.join(f'{q} {m[:3]}' for q, m in cols) + ' |')
             print('|---|' + '---|' * len(cols))
-            base = [idx.get(('1x', 1, m, grp)) for m in MODES]
-            print('| 1× | ' + ' | '.join(fmt(base[MODES.index(m)], metric) if metric != 'cot_tokens'
-                                          else (f"{base[MODES.index(m)][metric]:.0f}" if base[MODES.index(m)] else '')
+            base = {m: idx.get(('1x', 1, m, grp)) for m in modes}
+            print('| 1× | ' + ' | '.join(fmt(base[m], metric) if metric == 'acc'
+                                          else (f"{base[m][metric]:.0f}" if base[m] else '')
                                           for q, m in cols) + ' |')
             for ra in ratios:
                 cells = []
                 for q, m in cols:
                     s = idx.get((q, ra, m, grp))
-                    if metric == 'cot_tokens':
+                    if metric != 'acc':
                         cells.append('' if not s else f"{s[metric]:.0f}" + ('*' if s['partial'] else ''))
                     else:
                         cells.append(fmt(s, metric))
                 print(f'| {ra}× | ' + ' | '.join(cells) + ' |')
-            fl = idx.get(('floor', 1, 'immediate', grp))
-            if fl and metric == 'acc':
-                print(f"| floor | {fl['acc']:.2f} (immediate, no document) |" + ' |' * (len(cols) - 1))
             print()
     print(f"-> {path}")
 
@@ -236,98 +321,218 @@ def plot(args):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    import numpy as np
     rows = _load(args.rows)
     summ = summarize(rows)
     os.makedirs(args.out, exist_ok=True)
     idx = {(s['qset'], s['ratio'], s['mode'], s['group']): s for s in summ}
     qsets = [q for q in ('R', 'SS') if any(s['qset'] == q for s in summ)]
     ratios = [1] + sorted({s['ratio'] for s in summ if s['qset'] in ('R', 'SS')})
+    modes = _modes_present(summ)
     cmap = plt.get_cmap('viridis')
     color = {ra: cmap(i / max(1, len(ratios) - 1)) for i, ra in enumerate(ratios)}
     title = {'R': 'Repeat-prefill (R)', 'SS': 'Self-study (SS)'}
+    groups = [g for g in TYPES + [f'logic/{k}' for k in LOGIC_KINDS]
+              if any(s['group'] == g for s in summ)]
+
+    def row(q, ra, grp):
+        """The cells of one (query set, ratio) row that exist, in mode order."""
+        src = '1x' if ra == 1 else q
+        return [(m, idx[(src, ra, m, grp)]) for m in modes if (src, ra, m, grp) in idx]
 
     # 1) per type: accuracy vs measured mean CoT tokens, one line per ratio (modes = points)
-    for grp in TYPES + [f'logic/{k}' for k in LOGIC_KINDS]:
-        if not any(s['group'] == grp for s in summ):
-            continue
+    for grp in groups:
         fig, axes = plt.subplots(1, len(qsets), figsize=(5.2 * len(qsets), 4.2), sharey=True,
                                  squeeze=False)
         xmax = max((s['cot_tokens'] or 0) for s in summ if s['group'] == grp) * 1.05 + 1
         for ax, q in zip(axes[0], qsets):
             for ra in ratios:
-                src = '1x' if ra == 1 else q
-                pts = [idx.get((src, ra, m, grp)) for m in MODES]
-                pts = [p for p in pts if p]
+                pts = [s for _, s in row(q, ra, grp)]
                 if not pts:
                     continue
                 ax.plot([p['cot_tokens'] for p in pts], [p['acc'] for p in pts], marker='o',
                         color=color[ra], label=f'{ra}x', lw=2, ms=5,
                         linestyle='--' if any(p['partial'] for p in pts) else '-')
-            fl = idx.get(('floor', 1, 'immediate', grp))
-            if fl:
-                ax.plot([0], [fl['acc']], 'x', color='0.4', ms=8, label='no document')
             ax.set_title(title[q])
             ax.set_xlim(-0.02 * xmax, xmax)
             ax.set_ylim(-0.03, 1.03)
-            ax.set_xlabel('measured mean CoT tokens (points: immediate, moderate, long)')
+            ax.set_xlabel(f"measured mean CoT tokens (points: {', '.join(modes)})")
             ax.grid(alpha=0.3)
         axes[0][0].set_ylabel(f'accuracy, exact ({grp})')
         handles = {}
         for ax in axes[0]:
             for h, l in zip(*ax.get_legend_handles_labels()):
                 handles.setdefault(l, h)
-        order = [f'{ra}x' for ra in ratios if f'{ra}x' in handles] + \
-                [l for l in handles if not l.endswith('x') or l == 'no document']
-        order = list(dict.fromkeys(order))
+        order = [f'{ra}x' for ra in ratios if f'{ra}x' in handles]
         axes[0][-1].legend([handles[l] for l in order], order, title='compression',
                            loc='best', fontsize=8)
-        fig.suptitle(f'Mixed dataset, {grp}: accuracy vs CoT length '
-                     f'(100 docs; dashed = cell still running)')
+        running = any(s['partial'] for s in summ if s['group'] == grp)
+        fig.suptitle(f'Mixed dataset, {grp}: accuracy vs CoT length (100 docs'
+                     + ('; dashed = cell still running)' if running else ')'))
         fig.tight_layout()
         fn = os.path.join(args.out, f"acc_vs_cot_{grp.replace('/', '_')}.png")
         fig.savefig(fn, dpi=150)
         plt.close(fig)
         print('  ', fn)
 
-    # 2) overview: accuracy vs compression ratio, rows = query set, cols = type, lines = mode
-    mcol = {'immediate': '#d95f02', 'moderate': '#7570b3', 'long': '#1b9e77'}
-    fig, axes = plt.subplots(len(qsets), len(TYPES), figsize=(2.6 * len(TYPES), 2.6 * len(qsets)),
-                             sharex=True, sharey=True, squeeze=False)
-    for i, q in enumerate(qsets):
-        for j, t in enumerate(TYPES):
-            ax = axes[i][j]
-            for m in MODES:
-                # NaN for a missing cell breaks the line instead of bridging the gap
-                xs, ys, part = [], [], False
-                for ra in ratios:
-                    s = idx.get(('1x' if ra == 1 else q, ra, m, t))
-                    xs.append(ra)
-                    ys.append(s['acc'] if s else float('nan'))
-                    part |= bool(s and s['partial'])
-                if any(y == y for y in ys):
-                    ax.plot(xs, ys, marker='o', color=mcol[m], ms=3, lw=1.5, label=m,
-                            linestyle='--' if part else '-')
-            fl = idx.get(('floor', 1, 'immediate', t))
-            if fl:
-                ax.plot([1], [fl['acc']], 'x', color='0.4', ms=6, label='no document')
+    # 2) per type: isolines of accuracy over (CoT length, compression), the form of
+    # figures/phase1/surface.png. Prompt modes have no fixed length, so each ratio's row is
+    # interpolated (in log tokens) between its measured points and left blank outside them.
+    # Immediate has no CoT and is drawn at X0, labelled 0. Dots = measured cells.
+    X0 = 2
+    xg = np.logspace(1, 11, 400, base=2)
+    lx = np.log2(xg)
+    for grp in groups:
+        fig, axes = plt.subplots(1, len(qsets), figsize=(6.2 * len(qsets), 5.0), sharey=True,
+                                 squeeze=False)
+        im = None
+        for ax, q in zip(axes[0], qsets):
+            Z = np.full((len(ratios), len(xg)), np.nan)
+            dots = []
+            for i, ra in enumerate(ratios):
+                xy = sorted((X0 if m == 'immediate' else max(X0, s['cot_tokens'] or 0), s['acc'])
+                            for m, s in row(q, ra, grp))
+                dots += [(x, ra) for x, _ in xy]
+                if len(xy) < 2:
+                    continue
+                xs = np.log2([x for x, _ in xy])
+                inside = (lx >= xs[0]) & (lx <= xs[-1])
+                Z[i, inside] = np.interp(lx[inside], xs, [y for _, y in xy])
+            m = np.ma.masked_invalid(Z)
+            im = ax.contourf(xg, ratios, m, levels=np.linspace(0, 1, 11), cmap='viridis',
+                             vmin=0, vmax=1)
+            if np.isfinite(Z).sum() > 3:
+                cs = ax.contour(xg, ratios, m, levels=[.2, .4, .6, .8], colors='white',
+                                linewidths=1.2)
+                ax.clabel(cs, inline=True, fontsize=8, fmt='%.1f')
+            ax.plot([d[0] for d in dots], [d[1] for d in dots], 'o', color='white', ms=3.5,
+                    mec='0.25', mew=0.6, ls='none')
             ax.set_xscale('log', base=2)
-            ax.set_xticks(ratios)
-            ax.set_xticklabels([f'{r}' for r in ratios], fontsize=7)
-            ax.set_ylim(-0.03, 1.03)
-            ax.grid(alpha=0.3)
-            if i == 0:
-                ax.set_title(t, fontsize=10)
-            if j == 0:
-                ax.set_ylabel(f'{title[q]}\naccuracy', fontsize=9)
-            if i == len(qsets) - 1:
-                ax.set_xlabel('compression (x)', fontsize=8)
-    axes[0][-1].legend(fontsize=7, loc='best')
-    fig.suptitle('Mixed dataset: accuracy vs compression, per question type (dashed = cell still running)')
-    fig.tight_layout()
-    fn = os.path.join(args.out, 'acc_vs_ratio_overview.png')
-    fig.savefig(fn, dpi=150)
-    plt.close(fig)
-    print('  ', fn)
+            ax.set_yscale('log', base=2)
+            xt = [X0, 8, 32, 128, 512, 2048]
+            ax.set_xticks(xt)
+            ax.set_xticklabels(['0'] + [str(x) for x in xt[1:]])
+            ax.set_yticks(ratios)
+            ax.set_yticklabels([f'{r}x' for r in ratios])
+            ax.set_xlim(X0 * 0.85, 2048 * 1.15)
+            ax.set_ylim(max(ratios) * 1.25, min(ratios) * 0.8)   # light compression on top
+            ax.set_xlabel('measured mean CoT tokens (0 = immediate)')
+            ax.set_title(title[q], fontsize=11)
+        axes[0][0].set_ylabel('cache compression')
+        fig.colorbar(im, ax=axes[0].tolist(), label=f'accuracy, exact ({grp})', pad=0.02)
+        fig.suptitle(f'Mixed dataset, {grp}: accuracy over compression and CoT length (100 docs)')
+        fn = os.path.join(args.out, f"iso_{grp.replace('/', '_')}.png")
+        fig.savefig(fn, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print('  ', fn)
+
+
+# ----------------------------------------------------------------------------- exchange
+def exchange(args):
+    """Idea 1 read-off: per type, query set and ratio, what CoT buys and what it costs.
+
+    Per cell: accuracy without CoT (immediate) and with the best CoT mode (picked on the test
+    set, so an upper envelope over modes); the gain, tested with Greg's paired bootstrap; the
+    CoT's KV cost. Then the smallest measured cache on the same query set's no-CoT curve (1x,
+    4x, ...) that the CoT cell does NOT significantly beat (same test): "without CoT you need
+    this cache". Net saved = that no-CoT cell's peak minus the CoT cell's peak. All bytes are
+    effective (AM paper §3.4). Matching only against measured ratios keeps it a bound, not an
+    interpolation, and makes a CoT saving harder to claim, not easier.
+    """
+    rows = _load(args.rows)
+    _attach_effective(rows, os.path.join(os.path.dirname(args.rows) or '.', 'mixed_docs.csv'))
+    summ = [s for s in summarize(rows) if s['group'] in TYPES]
+    idx = {(s['qset'], s['ratio'], s['mode'], s['group']): s for s in summ}
+    by = defaultdict(list)
+    for r in rows:
+        by[(r['qset'], r['ratio'], r['mode'], r['qtype'])].append(r)
+    modes = _modes_present(summ)
+    cot_modes = [m for m in modes if m != 'immediate']
+    ratios = sorted({s['ratio'] for s in summ if s['qset'] in ('R', 'SS')})
+
+    def better(cot_key, base_key):
+        """+1 / -1 / 0: CoT cell significantly above / below the other cell (paired bootstrap)."""
+        res = paired_bootstrap(by[base_key], by[cot_key], n=args.n)
+        if res is None:
+            return 0, None
+        if res['delta'] > 0 and res['p'] < 0.05:
+            return 1, res['p']
+        if res['delta'] < 0 and res['p_rev'] < 0.05:
+            return -1, res['p_rev']
+        return 0, res['p'] if res['delta'] >= 0 else res['p_rev']
+
+    out = []
+    for grp in TYPES:
+        for q in ('R', 'SS'):
+            curve = [(c, r) for c, r in [('1x', 1)] + [(q, r) for r in ratios]
+                     if (c, r, 'immediate', grp) in idx]
+            for c, r in [('1x', 1)] + [(q, r) for r in ratios]:
+                if c == '1x' and q == 'SS':
+                    continue                                   # 1x is shared; report it once
+                imm = idx.get((c, r, 'immediate', grp))
+                cand = [idx[(c, r, m, grp)] for m in cot_modes if (c, r, m, grp) in idx]
+                if not imm or not cand:
+                    continue
+                best = max(cand, key=lambda x: (round(x['acc'], 6), -(x['cot_tokens'] or 0)))
+                ck = (c, r, best['mode'], grp)
+                gsig, gp = better(ck, (c, r, 'immediate', grp))
+                pts = sorted((idx[(mc, mr, 'immediate', grp)] for mc, mr in curve),
+                             key=lambda x: -x['stored_eff_mb'])          # 1x first
+                beaten = [better(ck, (x['qset'], x['ratio'], 'immediate', grp))[0] > 0 for x in pts]
+                ok = [i for i, b in enumerate(beaten) if not b]
+                match = pts[max(ok)] if ok else None           # smallest no-CoT cache not beaten
+                below = pts[max(ok) + 1] if ok and max(ok) + 1 < len(pts) else None
+                # the no-CoT cache that matches lies in (below, match], so net saved does too
+                net_hi = (match['peak_eff_mb'] - best['peak_eff_mb']) if match else None
+                net_lo = (below['peak_eff_mb'] - best['peak_eff_mb']) if below else None
+                if gsig < 0:
+                    verdict = 'CoT hurts'
+                elif gsig == 0:
+                    verdict = 'no gain'
+                elif match is None:
+                    verdict = 'needs CoT'
+                elif net_lo is not None and net_lo >= 0:
+                    verdict = 'saves memory'
+                elif net_hi <= 0:
+                    verdict = 'costs memory'
+                else:
+                    verdict = 'unclear'
+                out.append(dict(
+                    group=grp, qset=c, ratio=r, acc_imm=imm['acc'],
+                    **{f'acc_{m}': (idx[(c, r, m, grp)]['acc'] if (c, r, m, grp) in idx else None) for m in cot_modes},
+                    best_mode=best['mode'], acc_cot=best['acc'], gain=best['acc'] - imm['acc'],
+                    gain_sig=gsig, gain_p=gp, cot_tokens=best['cot_tokens'], cot_kv_mb=best['cot_kv_mb'],
+                    stored_eff_mb=imm['stored_eff_mb'], peak_imm_mb=imm['peak_eff_mb'], peak_cot_mb=best['peak_eff_mb'],
+                    match_cell=(f"{match['qset']} {match['ratio']}x" if match else 'none'),
+                    match_acc=(match['acc'] if match else None),
+                    match_stored_mb=(match['stored_eff_mb'] if match else None),
+                    match_peak_mb=(match['peak_eff_mb'] if match else None),
+                    below_cell=(f"{below['qset']} {below['ratio']}x" if below else ''),
+                    net_saved_lo_mb=net_lo, net_saved_hi_mb=net_hi, verdict=verdict))
+    path = os.path.join(os.path.dirname(args.rows) or '.', 'mixed_exchange.csv')
+    with open(path, 'w', newline='') as f:
+        w = csv.DictWriter(f, list(out[0].keys()))
+        w.writeheader()
+        w.writerows(out)
+    f1 = lambda v: '' if v is None else f'{v:.2f}'
+    fm = lambda v: '' if v is None else f'{v:,.0f}'
+    print('Effective MB. gain * = significant (paired bootstrap). "no-CoT needs" = the no-CoT cache that matches the CoT '
+          'cell lies between the largest cache it beats and the smallest it does not; net saved = no-CoT peak - CoT peak.')
+    for grp in TYPES:
+        print(f"\n### {grp}\n")
+        print('| cell | no CoT | best CoT | gain | CoT KV MB | stored MB | peak with CoT | no-CoT needs | net saved MB | verdict |')
+        print('|---|---|---|---|---|---|---|---|---|---|')
+        for o in out:
+            if o['group'] == grp:
+                m = ('never' if o['match_cell'] == 'none' else
+                     f"between {o['below_cell']} and {o['match_cell']}" if o['below_cell'] else f"<= {o['match_cell']}")
+                net = '' if o['net_saved_hi_mb'] is None else (
+                    f"{fm(o['net_saved_lo_mb'])} to {fm(o['net_saved_hi_mb'])}" if o['net_saved_lo_mb'] is not None
+                    else f"<= {fm(o['net_saved_hi_mb'])}")
+                print(f"| {o['qset']} {o['ratio']}x | {f1(o['acc_imm'])} | {f1(o['acc_cot'])} ({o['best_mode'][:3]}) | "
+                      f"{100 * o['gain']:+.0f}{'*' if o['gain_sig'] else ''} | {fm(o['cot_kv_mb'])} | {fm(o['stored_eff_mb'])} | "
+                      f"{fm(o['peak_cot_mb'])} | {m} | {net} | {o['verdict']} |")
+    print(f"\n-> {path}")
 
 
 # ----------------------------------------------------------------------------- sig
@@ -380,7 +585,7 @@ def _comparisons(cells):
     grid = sorted({(q, r) for q, r, _ in cells if q in ('1x', 'R', 'SS')},
                   key=lambda x: (['1x', 'R', 'SS'].index(x[0]), x[1]))
     for q, r in grid:                                              # CoT vs no CoT
-        for m in ('moderate', 'long'):
+        for m in ('brief', 'moderate', 'long'):
             if (q, r, 'immediate') in cells and (q, r, m) in cells:
                 name = '1x' if q == '1x' else f'{q} {r}x'
                 out.append(('cot', f'{name}: {m} vs immediate', (q, r, 'immediate'), (q, r, m)))
@@ -469,12 +674,15 @@ def main():
     p = sub.add_parser('plot')
     p.add_argument('--rows', default='results/mixed_rows.csv')
     p.add_argument('--out', default='../Notes/figures/mixed')
+    x = sub.add_parser('exchange')
+    x.add_argument('--rows', default='results/mixed_rows.csv')
+    x.add_argument('--n', type=int, default=10000)
     s = sub.add_parser('sig')
     s.add_argument('--rows', default='results/mixed_rows.csv')
     s.add_argument('--kinds', action='store_true', help='also test logic kinds separately')
     s.add_argument('--n', type=int, default=10000)
     args = ap.parse_args()
-    {'extract': extract, 'table': table, 'plot': plot, 'sig': sig}[args.cmd](args)
+    {'extract': extract, 'table': table, 'plot': plot, 'sig': sig, 'exchange': exchange}[args.cmd](args)
 
 
 if __name__ == '__main__':

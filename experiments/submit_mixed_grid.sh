@@ -4,7 +4,8 @@
 #   1x row      no compaction (METHOD=original, vLLM), shared by every query set
 #   floor       1x, document replaced by a one-line stand-in (mixed_v2_4k_noctx), immediate
 #   compressed  query set {R, SS} x ratio {4, 8, 16, 32, 64}x
-#   modes       {immediate, moderate, long} (prompt modes, no hard cap; ceiling 2048)
+#   modes       {immediate, moderate, long} (prompt modes, no hard cap; ceiling 2048);
+#               brief added afterwards: MODES=brief ONLY=1x|compressed
 #
 # Dataset: mixed_v2_4k, all 100 docs, all 2,831 questions (logic included).
 #
@@ -42,9 +43,9 @@ tsize() { case $1 in
 # Limits from the H200 smoke (2 docs, 16x long): ~220-240 s/doc generation, i.e. ~7-9 h
 # for 100 docs in long mode; moderate batches also hit the 2,048 cap (§B8g).
 # Override from the smoke-run timings: T1X_*, TC_* env vars.
-t1x() { case $1 in immediate) echo "${T1X_IMM:-01:00:00}" ;;
+t1x() { case $1 in immediate) echo "${T1X_IMM:-01:00:00}" ;; brief) echo "${T1X_BRI:-01:30:00}" ;;
   moderate) echo "${T1X_MOD:-02:00:00}" ;; long) echo "${T1X_LONG:-03:00:00}" ;; esac; }
-tc()  { case $1 in immediate) echo "${TC_IMM:-03:00:00}" ;;
+tc()  { case $1 in immediate) echo "${TC_IMM:-03:00:00}" ;; brief) echo "${TC_BRI:-04:00:00}" ;;
   moderate) echo "${TC_MOD:-12:00:00}" ;; long) echo "${TC_LONG:-14:00:00}" ;; esac; }
 
 n=0
