@@ -15,6 +15,8 @@
 #   bash experiments/submit_mixed_grid.sh               # the grid (34 jobs)
 #   ONLY=1x | floor | compressed                        # one part only
 #   ONLY=filler DRYRUN=1 ...                            # phase 2: matched-length filler twins (22)
+#   ONLY=kvzip_smoke | kvzip                            # KVzip as published (METHOD=kvzip), on
+#                                                       # ${TASK}_nologic: same docs, logic not asked
 set -eo pipefail
 
 TASK="${TASK:-mixed_v2_4k}"
@@ -111,7 +113,21 @@ case "$ONLY" in
       done
     done
     ;;
-  *) echo "ONLY must be all|smoke|1x|floor|compressed|filler" >&2; exit 2 ;;
+  kvzip_smoke)
+    # 2 docs, 16x, long: the port runs end to end and its result JSON parses.
+    submit mx_kvz_smk "${TASK}_nologic" mixed_KVZ_smoke 0.0625 kvzip long repeat 01:00:00 "" 2
+    ;;
+  kvzip)
+    # KVzip (official/compaction/compaction_methods/kvzip.py) on the same ratios and modes.
+    # Logic questions are not asked; the logic block stays in every document.
+    for r in $RATIOS; do
+      for mode in $MODES; do
+        submit "mx_KVZ_${r}_${mode:0:3}" "${TASK}_nologic" mixed_KVZ "$(tsize $r)" kvzip "$mode" \
+               repeat "${TKVZ:-$(tc $mode)}" "" "$N"
+      done
+    done
+    ;;
+  *) echo "ONLY must be all|smoke|1x|floor|compressed|filler|kvzip_smoke|kvzip" >&2; exit 2 ;;
 esac
 
 echo ""

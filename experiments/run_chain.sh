@@ -10,6 +10,7 @@
 #   TASK          chain dataset name, i.e. data/chain/${TASK}.jsonl
 #   TARGET_SIZE   1.0 | 0.25 | 0.125 | 0.0625 | 0.03125 | 0.015625  (1x..64x)
 #   METHOD        am (attention matching) | original (uncompressed baseline)
+#                 | kvzip (KVzip as published, official/compaction/compaction_methods/kvzip.py)
 #   COT_BUDGET    0 | 64 | 256 | 1024   decode cap for the reasoning stage
 #   COT_MODE      reason | filler       filler = padding of the same token count
 #   N             documents (default 50)
@@ -51,9 +52,20 @@ case "$TARGET_SIZE" in
   *)          RATIO="ts${TARGET_SIZE}" ;;
 esac
 
+ALGO_CONFIG=best
+BUDGET_FLAGS="--precomputed-budget-path head_budget_optimization/head_budgets/Qwen3-4B-Instruct-2507/optimized_agnostic.json --max-ratio-per-head 0.95"
 if [ "$METHOD" = "original" ]; then
   METHODS="original"
   RATIO=1x                      # no compaction happens; target-size is ignored
+elif [ "$METHOD" = "kvzip" ]; then
+  # KVzip chunks the context itself (2,000 tokens) and selects over the whole context, so
+  # no AM chunking; it sets its own head budgets and builds no reference queries, so no
+  # budget file, query config or reconstruction stats.
+  METHODS="kvzip_original"
+  ALGO_CONFIG=kvzip-original
+  BUDGET_FLAGS=""
+  CHUNKING=none
+  STATS=0
 else
   METHODS="highest_attn_keys_rms_nnls2_-3_3_lsq_on-policy"
 fi
@@ -95,9 +107,8 @@ python -u -m evaluation.run_qa_evaluation \
   --methods ${METHODS} \
   --target-size "${TARGET_SIZE}" \
   --query-config "${QUERY_CONFIG}" \
-  --algorithm-config best \
-  --precomputed-budget-path head_budget_optimization/head_budgets/Qwen3-4B-Instruct-2507/optimized_agnostic.json \
-  --max-ratio-per-head 0.95 \
+  --algorithm-config "${ALGO_CONFIG}" \
+  ${BUDGET_FLAGS} \
   --compute-perplexity 0 \
   --compute-gold-perplexity 0 \
   --chunking "${CHUNKING}" \

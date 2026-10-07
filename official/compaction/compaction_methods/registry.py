@@ -16,6 +16,7 @@ from .summarize import SummarizeCompaction
 from .summarize_then_compact import SummarizeThenCompact
 from .duo_attention import DuoAttentionCompaction
 from .no_context import NoContextCompaction
+from .kvzip import KVzipCompaction
 from ..algorithms import ALGORITHM_REGISTRY
 
 
@@ -95,6 +96,12 @@ def get_compaction_method(
     if base_algorithm == 'global_highest_attention_keys':
         algorithm_kwargs = {k: v for k, v in method_kwargs.items() if k != 'algorithm'}
         return GlobalHighestAttentionKeysCompaction(config_name=method_name, **algorithm_kwargs)
+
+    if base_algorithm == 'kvzip':
+        # KVzip, ported from snu-mllab/KVzip (compaction_methods/kvzip.py). Ignores head budgets.
+        excluded_keys = ('algorithm', 'precomputed_budget_path', 'max_ratio_per_head')
+        algorithm_kwargs = {k: v for k, v in method_kwargs.items() if k not in excluded_keys}
+        return KVzipCompaction(config_name=method_name, **algorithm_kwargs)
 
     if base_algorithm == 'duo_attention':
         algorithm_kwargs = {k: v for k, v in method_kwargs.items() if k != 'algorithm'}

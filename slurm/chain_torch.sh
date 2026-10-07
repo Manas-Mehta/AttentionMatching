@@ -22,6 +22,9 @@
 # The 1x cells run the uncompressed baseline through vLLM and need more room:
 #   sbatch --mem=120G --cpus-per-task=12 --export=ALL,...,METHOD=original,TARGET_SIZE=1.0 ...
 #
+# KVzip port check (no results written):
+#   sbatch --time=00:30:00 --export=ALL,RUN=verify_kvzip,N=3 slurm/chain_torch.sh
+#
 # Generate the datasets once on a login node before submitting:
 #   python experiments/make_chain_data.py --hops 4 --chains 1 --names word \
 #          --haystack prose --ctx 4096 --n 50
@@ -74,7 +77,12 @@ echo ""
 
 start=$(date +%s)
 set +e
-bash experiments/run_chain.sh
+if [ "${RUN:-}" = "verify_kvzip" ]; then
+  # One-off check of the KVzip port against an eager-attention reference (no results/).
+  (cd official && python -u ../experiments/verify_kvzip.py "${N:-3}")
+else
+  bash experiments/run_chain.sh
+fi
 rc=$?
 set -e
 elapsed=$(( $(date +%s) - start ))
