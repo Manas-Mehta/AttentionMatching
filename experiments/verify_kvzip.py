@@ -20,9 +20,10 @@ import sys
 import torch
 
 sys.path.insert(0, '.')
-from compaction.compaction_methods.kvzip import KVzipCompaction, _KVzipScore  # noqa: E402
+# evaluation first: importing compaction first hits a circular import inside the repo.
 from evaluation.datasets import load_mixed_data  # noqa: E402
 from evaluation.utils import extract_full_kv_cache, load_model_and_tokenizer  # noqa: E402
+from compaction.compaction_methods.kvzip import KVzipCompaction, _KVzipScore  # noqa: E402
 
 MODEL = 'Qwen/Qwen3-4B-Instruct-2507'
 N_DOCS = int(sys.argv[1]) if len(sys.argv) > 1 else 3
