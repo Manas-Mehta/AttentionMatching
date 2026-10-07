@@ -58,7 +58,8 @@ def _cells(root, partial):
     pats = [('1x', f'{root}/mixed_1x/mixed_v2_4k/*/*'),
             ('floor', f'{root}/mixed_1x/mixed_v2_4k_noctx/*/*'),
             ('R', f'{root}/mixed_R/mixed_v2_4k/*/*'),
-            ('SS', f'{root}/mixed_SS/mixed_v2_4k/*/*')]
+            ('SS', f'{root}/mixed_SS/mixed_v2_4k/*/*'),
+            ('KVZ', f'{root}/mixed_KVZ/mixed_v2_4k_nologic/*/*')]   # KVzip: logic not asked
     for qset, pat in pats:
         for d in sorted(glob.glob(pat)):
             ratio = RATIO_DIR.get(os.path.basename(os.path.dirname(d)))
@@ -215,7 +216,7 @@ def summarize(rows):
     g = _groups(rows)
     out = []
     for (qset, ratio, mode, grp), rs in sorted(g.items(), key=lambda kv: (
-            ['1x', 'floor', 'R', 'SS'].index(kv[0][0]), kv[0][1], MODE_ORDER.index(kv[0][2]),
+            ['1x', 'floor', 'R', 'SS', 'KVZ'].index(kv[0][0]), kv[0][1], MODE_ORDER.index(kv[0][2]),
             kv[0][3])):
         acc = _mean([r['score'] for r in rs])
         lo, hi = _boot_ci(rs)
@@ -257,7 +258,7 @@ def _recall(rows):
             by_cell[(r['qset'], r['ratio'], r['mode'])][r['doc_index']].append(r)
     out = []
     for (qset, ratio, mode), docs in sorted(by_cell.items(), key=lambda kv: (
-            ['1x', 'floor', 'R', 'SS'].index(kv[0][0]), kv[0][1], MODE_ORDER.index(kv[0][2]))):
+            ['1x', 'floor', 'R', 'SS', 'KVZ'].index(kv[0][0]), kv[0][1], MODE_ORDER.index(kv[0][2]))):
         per_doc = [dict(doc_index=d, score=_mean([r['score'] for r in rs])) for d, rs in docs.items()]
         lo, hi = _boot_ci(per_doc)
         out.append(dict(
