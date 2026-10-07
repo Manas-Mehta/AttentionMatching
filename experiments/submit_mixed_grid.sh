@@ -21,6 +21,9 @@
 #   ONLY=logic_gate                                     # standalone logic datasets at 1x (10 jobs):
 #                                                       # {logic_pw_4k, logic_sl_4k} x 4 modes, plus a
 #                                                       # no-document floor each; 50 docs; moderate cap 512
+#   ONLY=logic_smoke | logic_grid                       # ProofWriter (logic_pw_4k) compressed: smoke = 2 docs,
+#                                                       # 16x long, R/SS/KVZ (3 jobs); grid = {R, SS, KVZ} x
+#                                                       # LOGIC_RATIOS x 4 modes (36 jobs), 50 docs, moderate cap 512
 set -eo pipefail
 
 TASK="${TASK:-mixed_v2_4k}"
@@ -59,6 +62,10 @@ tc()  { case $1 in immediate) echo "${TC_IMM:-03:00:00}" ;; brief) echo "${TC_BR
 # 2026-09-29), so the modes did not differ in length there. Moderate's p90 outside cwe is
 # 250-420 tokens (1x-16x), so 512 rarely binds except on cwe. Long keeps 2,048.
 KVZ_RATIOS="${KVZ_RATIOS:-4x 8x 16x}"
+# Time limits for compressed ProofWriter cells (50 docs, ~20 questions per doc in one batch);
+# override from the logic smoke timings with TLG_* env vars.
+tlg() { case $1 in immediate) echo "${TLG_IMM:-01:30:00}" ;; brief) echo "${TLG_BRI:-02:00:00}" ;;
+  moderate) echo "${TLG_MOD:-04:00:00}" ;; long) echo "${TLG_LONG:-08:00:00}" ;; esac; }
 KVZ_MODES="${KVZ_MODES:-immediate brief moderate long}"
 kvz_cap() { case $1 in moderate) echo "${CAP_MOD:-512}" ;; *) echo "${COT_CEILING}" ;; esac; }
 
@@ -154,11 +161,29 @@ case "$ONLY" in
       submit "lg_${tag}_floor" "${lt}_noctx" logic_1x 1.0 original immediate repeat 01:00:00 "$BIG" "${N_LOGIC:-50}"
     done
     ;;
-  *) echo "ONLY must be all|smoke|1x|floor|compressed|filler|kvzip_smoke|kvzip|logic_gate" >&2; exit 2 ;;
+  logic_smoke|logic_grid)
+    # Compressed ProofWriter cells. AM (R, SS) and KVzip on the same documents, all four modes,
+    # moderate capped at 512 for every method (as in the 1x gate), so the modes are comparable.
+    lt=${LOGIC_TASK:-logic_pw_4k}
+    if [ "$ONLY" = "logic_smoke" ]; then lr="16x"; lm="long"; nd=2; root=logic_smoke
+    else lr="${LOGIC_RATIOS:-4x 8x 16x}"; lm="$KVZ_MODES"; nd="${N_LOGIC:-50}"; root=logic; fi
+    for r in $lr; do
+      for mode in $lm; do
+        for qs in R SS; do
+          submit "lg_${qs}_${r}_${mode:0:3}" "$lt" "${root}_${qs}" "$(tsize $r)" am "$mode" \
+                 "$(qconfig $qs)" "${TLG:-$(tlg $mode)}" "" "$nd" "$(kvz_cap $mode)"
+        done
+        submit "lg_KVZ_${r}_${mode:0:3}" "$lt" "${root}_KVZ" "$(tsize $r)" kvzip "$mode" repeat \
+               "${TLG:-$(tlg $mode)}" "" "$nd" "$(kvz_cap $mode)"
+      done
+    done
+    ;;
+  *) echo "ONLY must be all|smoke|1x|floor|compressed|filler|kvzip_smoke|kvzip|logic_gate|logic_smoke|logic_grid" >&2; exit 2 ;;
 esac
 
 echo ""
 case "$ONLY" in
+  logic_smoke|logic_grid) echo "${n} jobs  only=${ONLY}  task=${LOGIC_TASK:-logic_pw_4k}  methods=[R SS KVZ]  moderate cap=$(kvz_cap moderate)" ;;
   logic_gate) echo "${n} jobs  only=logic_gate  tasks=[${LOGIC_TASKS:-logic_pw_4k logic_sl_4k}]  1x  modes=[${KVZ_MODES}]+floor  moderate cap=$(kvz_cap moderate)  docs=${N_LOGIC:-50}" ;;
   kvzip*) echo "${n} jobs  only=${ONLY}  task=${TASK}_nologic  ratios=[${KVZ_RATIOS}]  modes=[${KVZ_MODES}]  moderate cap=$(kvz_cap moderate)" ;;
   *) echo "${n} jobs  only=${ONLY}  task=${TASK}  qsets=[${QSETS}]  ratios=[${RATIOS}]  modes=[${MODES}]" ;;
