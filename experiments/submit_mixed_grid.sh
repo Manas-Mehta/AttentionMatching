@@ -16,7 +16,8 @@
 #   ONLY=1x | floor | compressed                        # one part only
 #   ONLY=filler DRYRUN=1 ...                            # phase 2: matched-length filler twins (22)
 #   ONLY=kvzip_smoke | kvzip                            # KVzip as published (METHOD=kvzip), on
-#                                                       # ${TASK}_nologic: same docs, logic not asked
+#                                                       # ${TASK}_nologic: same docs, logic not asked;
+#                                                       # 4 modes, 4/8/16x, moderate capped at 512
 set -eo pipefail
 
 TASK="${TASK:-mixed_v2_4k}"
@@ -50,9 +51,17 @@ t1x() { case $1 in immediate) echo "${T1X_IMM:-01:00:00}" ;; brief) echo "${T1X_
 tc()  { case $1 in immediate) echo "${TC_IMM:-03:00:00}" ;; brief) echo "${TC_BRI:-04:00:00}" ;;
   moderate) echo "${TC_MOD:-12:00:00}" ;; long) echo "${TC_LONG:-14:00:00}" ;; esac; }
 
+# KVzip cells (ONLY=kvzip_smoke|kvzip): all four modes, and moderate capped below long.
+# In the AM grid both shared the 2,048 ceiling and cwe ran to it in both (findings §B8,
+# 2026-09-29), so the modes did not differ in length there. Moderate's p90 outside cwe is
+# 250-420 tokens (1x-16x), so 512 rarely binds except on cwe. Long keeps 2,048.
+KVZ_RATIOS="${KVZ_RATIOS:-4x 8x 16x}"
+KVZ_MODES="${KVZ_MODES:-immediate brief moderate long}"
+kvz_cap() { case $1 in moderate) echo "${CAP_MOD:-512}" ;; *) echo "${COT_CEILING}" ;; esac; }
+
 n=0
-submit() {   # name  task  outroot  target-size  method  mode  query-config  time  extra  ndocs
-  local cmd="sbatch --job-name=$1 --partition=${PARTS} --time=$8 $9 --export=ALL,TASK=$2,TARGET_SIZE=$4,METHOD=$5,COT_PROMPT=$6,COT_MODE=reason,COT_CEILING=${COT_CEILING},N=${10},OUTROOT=$3,QUERY_CONFIG=$7 slurm/chain_torch.sh"
+submit() {   # name  task  outroot  target-size  method  mode  query-config  time  extra  ndocs  [ceiling]
+  local cmd="sbatch --job-name=$1 --partition=${PARTS} --time=$8 $9 --export=ALL,TASK=$2,TARGET_SIZE=$4,METHOD=$5,COT_PROMPT=$6,COT_MODE=reason,COT_CEILING=${11:-${COT_CEILING}},N=${10},OUTROOT=$3,QUERY_CONFIG=$7 slurm/chain_torch.sh"
   if [ "$DRYRUN" = "1" ]; then echo "$cmd"; else eval "$cmd"; fi
   n=$((n+1))
 }
@@ -114,16 +123,19 @@ case "$ONLY" in
     done
     ;;
   kvzip_smoke)
-    # 2 docs, 16x, long: the port runs end to end and its result JSON parses.
-    submit mx_kvz_smk "${TASK}_nologic" mixed_KVZ_smoke 0.0625 kvzip long repeat 01:00:00 "" 2
+    # 2 docs, 16x, every mode: the port runs end to end, caps apply, result JSONs parse.
+    for mode in $KVZ_MODES; do
+      submit "mx_kvz_smk_${mode:0:3}" "${TASK}_nologic" mixed_KVZ_smoke 0.0625 kvzip "$mode" repeat \
+             01:00:00 "" 2 "$(kvz_cap $mode)"
+    done
     ;;
   kvzip)
-    # KVzip (official/compaction/compaction_methods/kvzip.py) on the same ratios and modes.
+    # KVzip (official/compaction/compaction_methods/kvzip.py), 4 modes x KVZ_RATIOS.
     # Logic questions are not asked; the logic block stays in every document.
-    for r in $RATIOS; do
-      for mode in $MODES; do
+    for r in $KVZ_RATIOS; do
+      for mode in $KVZ_MODES; do
         submit "mx_KVZ_${r}_${mode:0:3}" "${TASK}_nologic" mixed_KVZ "$(tsize $r)" kvzip "$mode" \
-               repeat "${TKVZ:-$(tc $mode)}" "" "$N"
+               repeat "${TKVZ:-$(tc $mode)}" "" "$N" "$(kvz_cap $mode)"
       done
     done
     ;;
@@ -131,4 +143,7 @@ case "$ONLY" in
 esac
 
 echo ""
-echo "${n} jobs  only=${ONLY}  task=${TASK}  qsets=[${QSETS}]  ratios=[${RATIOS}]  modes=[${MODES}]"
+case "$ONLY" in
+  kvzip*) echo "${n} jobs  only=${ONLY}  task=${TASK}_nologic  ratios=[${KVZ_RATIOS}]  modes=[${KVZ_MODES}]  moderate cap=$(kvz_cap moderate)" ;;
+  *) echo "${n} jobs  only=${ONLY}  task=${TASK}  qsets=[${QSETS}]  ratios=[${RATIOS}]  modes=[${MODES}]" ;;
+esac
