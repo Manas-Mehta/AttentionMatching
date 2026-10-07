@@ -18,6 +18,9 @@
 #   ONLY=kvzip_smoke | kvzip                            # KVzip as published (METHOD=kvzip), on
 #                                                       # ${TASK}_nologic: same docs, logic not asked;
 #                                                       # 4 modes, 4/8/16x, moderate capped at 512
+#   ONLY=logic_gate                                     # standalone logic datasets at 1x (10 jobs):
+#                                                       # {logic_pw_4k, logic_sl_4k} x 4 modes, plus a
+#                                                       # no-document floor each; 50 docs; moderate cap 512
 set -eo pipefail
 
 TASK="${TASK:-mixed_v2_4k}"
@@ -139,11 +142,24 @@ case "$ONLY" in
       done
     done
     ;;
-  *) echo "ONLY must be all|smoke|1x|floor|compressed|filler|kvzip_smoke|kvzip" >&2; exit 2 ;;
+  logic_gate)
+    # Standalone logic datasets (experiments/make_logic_data.py), uncompressed: can the model
+    # do them at all, per mode, and does a no-document floor sit at the label share (~50%)?
+    for lt in ${LOGIC_TASKS:-logic_pw_4k logic_sl_4k}; do
+      tag=${lt#logic_}; tag=${tag%_4k}
+      for mode in $KVZ_MODES; do
+        submit "lg_${tag}_1x_${mode:0:3}" "$lt" logic_1x 1.0 original "$mode" repeat \
+               "$(t1x $mode)" "$BIG" "${N_LOGIC:-50}" "$(kvz_cap $mode)"
+      done
+      submit "lg_${tag}_floor" "${lt}_noctx" logic_1x 1.0 original immediate repeat 01:00:00 "$BIG" "${N_LOGIC:-50}"
+    done
+    ;;
+  *) echo "ONLY must be all|smoke|1x|floor|compressed|filler|kvzip_smoke|kvzip|logic_gate" >&2; exit 2 ;;
 esac
 
 echo ""
 case "$ONLY" in
+  logic_gate) echo "${n} jobs  only=logic_gate  tasks=[${LOGIC_TASKS:-logic_pw_4k logic_sl_4k}]  1x  modes=[${KVZ_MODES}]+floor  moderate cap=$(kvz_cap moderate)  docs=${N_LOGIC:-50}" ;;
   kvzip*) echo "${n} jobs  only=${ONLY}  task=${TASK}_nologic  ratios=[${KVZ_RATIOS}]  modes=[${KVZ_MODES}]  moderate cap=$(kvz_cap moderate)" ;;
   *) echo "${n} jobs  only=${ONLY}  task=${TASK}  qsets=[${QSETS}]  ratios=[${RATIOS}]  modes=[${MODES}]" ;;
 esac

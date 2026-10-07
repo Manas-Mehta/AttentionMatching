@@ -931,11 +931,14 @@ def load_mixed_data(task: str) -> List[Dict]:
     no_logic = base.endswith('_nologic')
     if no_logic:
         base = base[:-len('_nologic')]
-    fp = Path('data/mixed') / f'{base}.jsonl'
+    # 'logic_*' = standalone logic documents (experiments/make_logic_data.py): same schema,
+    # one logic problem + prose filler per document, every question of qtype 'logic'.
+    root = 'data/logic' if base.startswith('logic_') else 'data/mixed'
+    fp = Path(root) / f'{base}.jsonl'
     if not fp.exists():
         raise ValueError(
-            f"Mixed dataset not found: {fp}. Generate it first with "
-            f"`python experiments/make_mixed_data.py`."
+            f"Dataset not found: {fp}. Generate it first with "
+            f"`python experiments/make_{'logic' if root == 'data/logic' else 'mixed'}_data.py`."
         )
     rows = []
     with open(fp) as f:
@@ -1251,8 +1254,9 @@ def load_dataset(dataset_name: str, include_diagnosis: bool = True) -> List[Dict
         # Phase 1 entity-attribute chains, e.g. 'chain_d4_b1_word_prose_4k_last'
         return load_chain_data(dataset_name)
 
-    elif dataset_name.startswith('mixed'):
-        # §B8 mixed-task documents, e.g. 'mixed_v2_4k' or 'mixed_v2_4k_noctx'
+    elif dataset_name.startswith('mixed') or dataset_name.startswith('logic_'):
+        # §B8 mixed-task documents, e.g. 'mixed_v2_4k' or 'mixed_v2_4k_noctx', and the
+        # standalone logic documents, e.g. 'logic_pw_4k' / 'logic_sl_4k_noctx'
         return load_mixed_data(dataset_name)
 
     elif dataset_name.startswith('ruler'):
@@ -1359,7 +1363,7 @@ def is_perplexity_dataset(dataset_name: str) -> bool:
 # the Phase 1 'chain' family, which is RULER variable_tracking with depth, breadth and
 # the two entropies opened up, and the §B8 'mixed' documents. All must go down the
 # RULER scoring / gold-perplexity path, not the MCQ path).
-RULER_DATASET_PREFIXES = ('ruler', 'keylen', 'chain', 'mixed')
+RULER_DATASET_PREFIXES = ('ruler', 'keylen', 'chain', 'mixed', 'logic_')
 RULER_DATASET_PREFIX = RULER_DATASET_PREFIXES[0]  # back-compat for any external refs
 
 
