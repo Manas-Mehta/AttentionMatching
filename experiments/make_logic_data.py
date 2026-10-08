@@ -65,7 +65,10 @@ PWL_LIST = ('List every fact about {S} that is stated in the text or follows fro
             'derived.')
 PWL_LIST_FORMAT = ("Output only the facts, one per line, each as a short sentence, with no "
                    "explanation and nothing else.")
-PWL_COPY = "Copy out the facts and rules from the text, word for word, one per line."
+# Points at the block's header: "the facts and rules" alone made the 1x model copy filler
+# prose on 10/50 documents (job 19414915).
+PWL_COPY = ('Copy out the section of the text that starts with "Facts and rules:", word for '
+            'word, one sentence per line.')
 PWL_COPY_FORMAT = "Output only the sentences, one per line, with no explanation and nothing else."
 
 
@@ -113,7 +116,8 @@ def pwl_questions(row):
     if set(S) != full:
         sys.exit(f"ERROR: {m['id']}: {len(full - set(S))} closure facts have no derivation")
     verbs = Counter(f[1] for f in full if f[1] != "is")
-    rel = verbs.most_common(1)[0][0] if verbs else None  # format example uses a verb the theory has
+    # format example uses the theory's most common verb (ties: alphabetical, so rebuilds match)
+    rel = min(verbs, key=lambda v: (-verbs[v], v)) if verbs else None
     qs = []
     for subj in sorted({f[0] for f in full}):
         items = [dict(fact=list(t), text=pw_fact_text(t), stated=S[t] == 0, depth=S[t])

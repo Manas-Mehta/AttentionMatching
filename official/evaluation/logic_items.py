@@ -15,7 +15,8 @@ The evaluator only needs the scalar (`item_score`). The breakdowns (`list_breakd
 
 Facts are parsed, not string-matched: "Dave is big and red", "big, red" (no subject) and
 "Dave is big." all give the same facts. Clauses that contain a negation are skipped
-(negated facts are never gold), and clauses about another entity are ignored.
+(negated facts are never gold), clauses about another entity are ignored, and lines that
+are rules (if / then / someone / all / people / things / they) are ignored.
 """
 import re
 from typing import Dict, List, Optional, Set, Tuple
@@ -30,6 +31,7 @@ ENTITIES = ["bald eagle", "anne", "bob", "charlie", "dave", "erin", "fiona", "ga
 _ENT = "|".join(ENTITIES)
 _LEAD = re.compile(rf"^\W*(?:\d+[.)]\s*)?\W*(?:the\s+)?({_ENT})\b(.*)$")
 _REL = re.compile(rf"\b({'|'.join(VERBS)})\s+(?:the\s+)?({_ENT})\b")
+_RULE = re.compile(r"\b(?:if|then|someone|something|all|people|things|they)\b")
 _NEG = re.compile(r"\bnot\b|n't\b|\bno\b|\bnever\b")
 _SPLIT = re.compile(r"[\n.;]+")
 # inside a line, a new clause starts at ", <entity>" or "and <entity> is/<verb>"
@@ -43,7 +45,9 @@ def parse_facts(text: str, subject: str) -> Set[Fact]:
     """Positive facts about `subject` (lower-case entity) asserted in `text`."""
     subject = subject.lower()
     out = set()
-    clauses = [c for line in _SPLIT.split(text.lower()) for c in _SUB.split(line)]
+    # a pasted rule ("If the cow is round then ...") asserts no fact
+    clauses = [c for line in _SPLIT.split(text.lower()) if not _RULE.search(line)
+               for c in _SUB.split(line)]
     for clause in clauses:
         if not clause.strip() or _NEG.search(clause):
             continue
