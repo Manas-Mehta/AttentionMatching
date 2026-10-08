@@ -954,7 +954,8 @@ def load_mixed_data(task: str) -> List[Dict]:
         for q in row['questions']:
             if no_logic and q['qtype'] == 'logic':
                 continue
-            fmt = MIXED_ANSWER_FORMAT[q['qtype']].format(n=len(q['answer']))
+            # logic_pwl questions carry their own format line and gold items
+            fmt = q.get('answer_format') or MIXED_ANSWER_FORMAT[q['qtype']].format(n=len(q['answer']))
             questions.append({
                 'question': q['question'],
                 'score_candidates': list(q['score_candidates']),
@@ -971,6 +972,8 @@ def load_mixed_data(task: str) -> List[Dict]:
                 'depth': q.get('depth'),
                 'ctx_tokens': row['ctx_tokens'],
                 'doc_index': row['doc_index'],
+                **({'logic_items': q['items'], 'logic_subject': q.get('subject')}
+                   if 'items' in q else {}),
             })
         data.append({
             'article_id': f"{task}_{idx}",

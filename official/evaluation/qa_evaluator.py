@@ -36,6 +36,7 @@ from .utils import (
     compute_article_indices,
 )
 from .datasets import load_dataset, is_perplexity_dataset, is_ruler_dataset, is_qasper_dataset
+from .logic_items import LOGIC_ITEM_QTYPES, item_score as logic_item_score
 
 
 def ruler_string_match_all(pred: str, refs: List[str]) -> float:
@@ -98,6 +99,8 @@ def set_overlap_score(pred: str, q: Dict) -> Optional[float]:
 
 def score_ruler_question(pred: str, q: Dict) -> float:
     """Pick the metric: exact set match for the chain family, substring for RULER."""
+    if q.get('qtype') in LOGIC_ITEM_QTYPES:  # ProofWriter list / copy questions
+        return logic_item_score(pred, q)
     refs = q.get('ruler_outputs', [])
     candidates = q.get('score_candidates')
     if candidates:
