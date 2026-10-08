@@ -68,7 +68,7 @@ PWL_LIST_FORMAT = ("Output only the facts, one per line, each as a short sentenc
 # Points at the block's header: "the facts and rules" alone made the 1x model copy filler
 # prose on 10/50 documents (job 19414915).
 PWL_COPY = ('Copy out the section of the text that starts with "Facts and rules:", word for '
-            'word, one sentence per line.')
+            'word, one sentence per line. Stop at the end of that section.')
 PWL_COPY_FORMAT = "Output only the sentences, one per line, with no explanation and nothing else."
 
 
@@ -128,7 +128,7 @@ def pwl_questions(row):
         qs.append(dict(qtype="logic_list", subject=subj.lower(), items=items,
                        question=PWL_LIST.format(S=S_, Sc=Sc, rel=r),
                        answer=[it["text"] for it in items], score_candidates=[],
-                       answer_format=PWL_LIST_FORMAT, max_new_tokens=160))
+                       answer_format=PWL_LIST_FORMAT, max_new_tokens=256))
     # copy question: every sentence, tagged by what removing it does to the closure
     b = row["blocks"]["logic"]
     sents = [s for s in row["context"][b["char_start"]:b["char_end"]].split("\n")[1:] if s.strip()]
