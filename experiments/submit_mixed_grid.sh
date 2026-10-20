@@ -67,7 +67,7 @@ KVZ_RATIOS="${KVZ_RATIOS:-4x 8x 16x}"
 tlg() { case $1 in immediate) echo "${TLG_IMM:-01:30:00}" ;; brief) echo "${TLG_BRI:-02:00:00}" ;;
   moderate) echo "${TLG_MOD:-04:00:00}" ;; long) echo "${TLG_LONG:-08:00:00}" ;; esac; }
 KVZ_MODES="${KVZ_MODES:-immediate brief moderate long}"
-kvz_cap() { case $1 in moderate) echo "${CAP_MOD:-512}" ;; *) echo "${COT_CEILING}" ;; esac; }
+kvz_cap() { case $1 in brief) echo "${CAP_BRI:-128}" ;; moderate) echo "${CAP_MOD:-512}" ;; *) echo "${COT_CEILING}" ;; esac; }
 
 n=0
 submit() {   # name  task  outroot  target-size  method  mode  query-config  time  extra  ndocs  [ceiling]

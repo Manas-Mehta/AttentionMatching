@@ -233,6 +233,7 @@ def _question_instruction(plan: "_CotPlan", question: Dict) -> str:
 #   AM_COT_PROMPT   '' (legacy fixed-cap) | immediate | brief | moderate | long
 #   AM_COT_CEILING  safety cap for the reasoning stage under a prompt mode; a guard
 #                   against runaways, NOT a budget (default 2048)
+#   AM_COT_CEILING_BRIEF  lower guard for brief mode only (default 128; min with the above)
 #   AM_COT_FILLER_TARGET  token count for the filler twin of a prompt mode, i.e. the
 #                   measured mean length of the paired reason run (0 = skip filler)
 _PROMPT_MODE_INSTRUCTION = {
@@ -369,6 +370,11 @@ def _cot_plan(question: Optional[Dict] = None) -> _CotPlan:
 
     if prompt_mode:                                    # method A
         ceiling = int(os.environ.get('AM_COT_CEILING', '2048'))
+        # Brief gets its own, lower guard (2026-10-20): over 15,400 brief answers (4k + 8k
+        # combined task) the median was ~20 tokens and p99 52-78; everything past ~100 was
+        # a runaway (mostly repetition loops) to the 2,048 ceiling. 128 cuts 0.45%.
+        if prompt_mode == 'brief':
+            ceiling = min(ceiling, int(os.environ.get('AM_COT_CEILING_BRIEF', '128')))
         fill_target = int(os.environ.get('AM_COT_FILLER_TARGET', '0'))
         has_turn = prompt_mode != 'immediate' and not probe_pinned
         instruction = _PROMPT_MODE_INSTRUCTION.get(prompt_mode, _COT_INSTRUCTION)
